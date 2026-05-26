@@ -1,0 +1,1081 @@
+# VX-Display 蓝牙上位机 & MCU 指令系统
+
+## 项目文件结构
+
+```
+vx-display/
+├── upper_computer/                    # PC 上位机 (Python)
+│   ├── requirements.txt               # bleak
+│   ├── main.py                        # tkinter UI 主窗口
+│   ├── ble_client.py                  # BLE 通信层 (asyncio后台线程)
+│   ├── protocol.py                    # 指令编解码 (:LOAD, :STATUS, :LIST, :DATA)
+│   ├── vxan.py                        # VXAN .bin 文件读取与校验
+│   ├── palette.py                     # MCU 调色板复刻 (256色调色板 + 亮度上限35)
+│   ├── preview.py                     # 3D 体素预览窗口 (纯 tkinter, PPM渲染)
+│   └── exporter.py                    # 调用 C# 导出器 (STL→.bin)
+│
+├── Core/user_code/                    # MCU 固件 (C)
+│   ├── bt_commands.h / .c             # 蓝牙指令处理 (新建)
+│   ├── sd_animation.h / .c            # SD卡 & 体素数据加载 (已修改，新增SD_ApplyVoxelData)
+│   ├── volume_buffer.h / .c           # 体素缓冲区
+│   ├── volume_to_ws2812.h / .c        # 体素渲染到WS2812
+│   ├── volume_hall.h / .c             # 霍尔传感器
+│   ├── motor_control.h / .c           # 电机稳速判断
+│   └── ...
+│
+├── Core/Src/main.c                    # 主程序 (已修改，集成BT指令)
+├── FATFS/Target/ffconf.h              # FatFS配置 (_USE_FIND改为2)
+└── CMakeLists.txt                     # 已添加 bt_commands.c
+```
+
+## 蓝牙通信协议
+
+| 指令 | 方向 | 说明 |
+|------|------|------|
+| `:LOAD <文件名>` | PC→MCU | 加载TF卡文件(.bin→体素模式, .slices→切片模式)，回 `OK` 或 `ERR:N` |
+| `:STATUS` | PC→MCU | 查询状态，回 `RPM:313 DLY:3834 F:1 S:1` |
+| `:LIST` | PC→MCU | 列出TF卡根目录 .bin 和 .slices 文件 |
+| `:DATA <字节数>` | PC→MCU | 进入二进制接收模式 (体素数据→RAM) |
+| `:SAVE <文件名> <字节数>` | PC→MCU | 接收文件并写入TF卡 (不加载) |
+
+二进制传输流程 (DATA):
+1. PC 发送 `:DATA 24592\n`，等待 500ms
+2. MCU 收到后停止空闲DMA，启动固定长度DMA(24592字节)
+3. PC 分120字节/包、15ms间隔发送体素数据（~8KB/s，匹配115200波特率）
+4. DMA收满后触发 `HAL_UART_RxCpltCallback`，设标志位
+5. 主循环 `BT_PollVoxelReady()` 调用 `SD_ApplyVoxelData()` 写入体素缓冲
+6. MCU 回复 `VOX:OK` 或 `VOX:ERR=N`
+
+文件保存流程 (SAVE):
+1. PC 发送 `:SAVE chiken.slices 230416\n`，等待 500ms
+2. MCU 主循环设 bt_save_receiving=1 (不操作文件)
+3. PC 分120字节/包、15ms间隔发送文件数据（~8KB/s，~28秒传完）
+4. 每个120B包触发UART空闲中断 → BT_FeedFileData() 追加到 bt_file_buf[RAM_D2]
+5. 累积满 bt_save_size 后自动置 bt_save_data_ready
+6. 主循环 BT_PollSaveFile():
+   a. f_open(FA_CREATE_ALWAYS) 创建文件
+   b. 循环: memcpy(bt_file_buf[RAM_D2] → bt_write_buf[AXI SRAM]) → f_write
+   c. f_sync → f_close
+7. MCU 回复 `SAVED OK` 或 `ERR:write failed`
+
+| 缓冲区 | 位置 | 用途 |
+|--------|------|------|
+| bt_file_buf[230416] | RAM_D2 (`.RAM_D1`) | UART DMA 接收 |
+| bt_write_buf[8192] | AXI SRAM (`.RAM_AXI`) | f_write 中转 |
+| bt_save_file (FIL) | AXI SRAM (`.RAM_AXI`) | FatFS 文件对象 |
+
+为什么不使用固定长度DMA:
+- HAL_UART_Receive_DMA Size 参数为 uint16_t (最大65535)
+- .slices 文件 230416 字节超出限制，截断为 33808
+- 改为空闲DMA分段累积：利用 BLE 每120B的15ms间隔产生的UART空闲检测
+
+为什么不能从 RAM_D2 直接 f_write:
+- f_write → SD_write 快速路径 → BSP_SD_WriteBlocks_DMA 直接从用户缓冲 DMA
+- STM32H743 SDMMC IDMA 不能可靠访问 RAM_D2 (0x30000000)
+- 所有已验证的 f_read 均用 AXI SRAM 缓冲 (SD_LoadStaticModel, SlicePlayer_Load)
+- 修复：memcpy 到 bt_write_buf[AXI SRAM] 后 f_write，与读路径一致
+
+FIL 必须在 AXI SRAM:
+- 与 SlicePlayer_Load 卡死原因相同：FIL 在 DTCMRAM 栈上(可缓存)
+- FatFS 通过 SDMMC IDMA 读写 FAT/目录扇区时，D-Cache 与 IDMA 之间的
+  缓存行共享导致 FIL 状态损坏 → f_write 写到错误簇 → 文件0KB
+
+:LOAD 文件类型自动检测:
+- 文件名以 .slices 结尾 → 调用 SlicePlayer_Load → 设置 slice_active=1
+- 其他文件 (.bin) → 调用 SD_LoadStaticModel → 设置 slice_active=0
+
+## MCU 端关键技术点
+
+DMA 模式切换 (bt_commands.c):
+- 使用 `HAL_UART_DMAStop` (非 AbortReceive) 清理 UART 状态
+- `huart4.ReceptionType = HAL_UART_RECEPTION_STANDARD` 防止HAL自动重启空闲DMA
+- 清除所有挂起的 UART 错误标志 (IDLE/ORE/FE/NE/PE)
+
+ISR 死锁修复:
+- `:LOAD` 和 `:LIST` 涉及SD卡阻塞操作，不可在UART中断回调中执行
+- 改为：ISR只记录命令到 `bt_cmd_pending` 标志，主循环 `BT_PollCommands()` 执行
+
+缓冲区位置:
+- 体素接收缓冲 `bt_voxel_buf[24592]` 在 AXI SRAM (`.RAM_AXI` section)
+- 文件接收缓冲 `bt_file_buf[230416]` 在 RAM_D2 (`.RAM_D1` section, DMA可访问)
+- 切片缓冲 `slice_buf[230400]` 在 AXI SRAM (`.RAM_AXI` section)
+- MPU 将 AXI SRAM (0x24000000) 设为非缓存 — 无需手动维护缓存一致性
+- RAM_D2 (0x30000000) 为默认可缓存，需用 SCB_CleanInvalidate/Invalidate DCache
+
+## 上位机架构
+
+线程模型:
+- 主线程 (tkinter) ← `queue.Queue` → 后台线程 (asyncio)
+- `root.after(100ms)` 轮询队列，所有UI更新安全地在主线程
+
+BLE 扫描:
+- 回调式扫描，实时显示发现的设备
+- 按 RSSI 信号强度排序
+- `D5:6D:01:74:5B:21` 为默认设备 (★★单片机设备)，自动选中
+
+3D 预览:
+- 独立 Toplevel 窗口，可拖拽旋转/滚轮缩放
+- 用 PPM (P6) 格式生成图像 → `tk.PhotoImage` 显示
+- 预览使用全亮度(0-255)调色板，比实际LED(上限35)更鲜艳
+- 白色背景，深色体素
+
+STL 转换:
+- 通过 `subprocess` 调用 `VxDisplay.Exporter.exe`
+- 必须 `cwd=exe所在目录` (否则找不到 AssimpNet.dll)
+- 支持参数：`-r 轴,角度` `-u 上轴` `-c R,G,B`
+
+## 调色板
+
+- 256 色调色板：绿→青→蓝→紫→红→橙→黄→白
+- MCU 亮度上限：`PALETTE_MAX_BRIGHTNESS = 35` (降低功耗)
+- 预览使用全亮度：`resolve_color_preview()` (0-255)
+- 文件调色板（索引1）可自定义：VXAN头部的 `palette_r/g/b` 字段
+
+## 已修复的关键 Bug
+
+| Bug | 原因 | 修复 |
+|-----|------|------|
+| BLE传输中断开 | 数据速率(40KB/s)超过UART(11.5KB/s)，模块缓冲区溢出 | 降速到8KB/s |
+| DMA静默失败 | `HAL_UART_AbortReceive` 未重置RxState | 改用 `HAL_UART_DMAStop` |
+| HAL自动重启覆盖 | 空闲DMA回调返回后HAL自动重启 | 设 `ReceptionType=STANDARD` |
+| :LOAD/:LIST死锁 | SD卡操作在UART ISR中阻塞等SDMMC DMA | 移到主循环执行 |
+| 预览颜色看不清 | 亮度上限35在暗色背景上不可见 | 白底 + 全亮度预览 |
+| 扫描找不到设备 | Service UUID过滤导致漏扫 | 无过滤全扫描 + RSSI排序 |
+| 设备名乱码 | 非ASCII字符 | 过滤到仅保留ASCII可打印字符 |
+
+## WS2812 刷新率分析
+
+### 硬件参数
+| 参数 | 值 |
+|------|-----|
+| LED 布局 | 32 条灯带 × 24 颗/条 = 768 颗 WS2812 |
+| GPIO | GPIOB(16路) + GPIOD(16路) = 32路并行 |
+| 每颗LED数据量 | 24 bit (GRB) |
+| 每条灯带总位数 | 24 × 24 = 576 bit |
+| 每bit时间片 | 3 个 timer slot |
+| TIM1/TIM2 时钟 | 320 MHz |
+| TIM Period | 80 → 81 tick/周期 = 253 ns/slot |
+| 单次WS2812波形长度 | 576bit × 3slot + 1200slot(Reset) = 2928 slot |
+| 单次WS2812传输时间 | 2928 × 253ns ≈ 741 µs |
+
+### 每列(相位)耗时构成
+| 阶段 | Release | Debug |
+|------|---------|-------|
+| 体素→LED缓冲区计算 (VolumeToWS2812_RenderNext) | ~300 µs | ~1200 µs |
+| 填位数据 (WS2812_FillBits) | ~150 µs | ~600 µs |
+| 波形编码 (Wave_Enable + port_encode) | ~100 µs | ~400 µs |
+| Cache 刷新 (CleanDCache) | ~50 µs | ~50 µs |
+| DMA 发送 WS2812 (硬件) | ~741 µs | ~741 µs |
+| 等待 DMA 完成 + 开销 | ~360 µs | ~360 µs |
+| **每列总计** | **~1700 µs** | **~3350 µs** |
+
+### 最大刷新率
+| 指标 | Release | Debug |
+|------|---------|-------|
+| 每列耗时 | ~1.70 ms | ~3.35 ms |
+| 50相位/圈耗时 | ~85 ms | ~168 ms |
+| 最大 RPM | ~705 RPM | ~358 RPM |
+| 最大体积 FPS | ~11.8 体素帧/秒 | ~6.0 体素帧/秒 |
+
+### 说明
+- 以上是主循环中 WS2812 渲染占满 CPU 的理论极限值
+- Debug 模式约比 Release 慢 2 倍（优化关闭 + 断言/检查开销）
+- 实际运行中受电机机械转速限制（当前 ~313 RPM）
+- 313 RPM 下每相位有 ~3.8ms 预算，Release 只用 ~1.7ms（~45% 占空比），有大量空闲
+- DMA 发送是硬件行为，Debug/Release 无差异
+
+## 硬件环境
+
+- MCU: STM32H743, CMSIS, HAL 库, 无 RTOS
+- 编译: CMake + Ninja, `build/Debug` 目录
+- 蓝牙模块: E104-BT52 (BLE 5.0, CC2640R2F)
+  - Service UUID: `0000FFF0`
+  - TX (Notify, 模块→手机): `0000FFF1`
+  - RX (Write,  手机→模块): `0000FFF2`
+  - 默认地址: `D5:6D:01:74:5B:21`
+- UART4: 115200 8N1, PA0=TX, PA1=RX, DMA1_Stream5(RX), DMA1_Stream6(TX)
+- 所有 DMA 可访问的缓冲区必须在 AXI SRAM (`.RAM_AXI` section, 0x24000000) 或 RAM_D2 (`.RAM_D1` section, 0x30000000)
+- DTCMRAM (0x20000000) 不可被 DMA 访问
+- 改动需保护 CubeMX USER CODE 区域
+
+## 预计算切片播放器 (slice_player)
+
+### 设计目标
+将实时体素投影（sin/cos旋转 + 768次体素查找 = ~650µs）替换为
+预计算的 24-bit RGB 切片数据直读（memcpy + FillWave = ~180µs）。
+
+### .slices 文件格式
+
+```
+偏移  大小   字段
+────────────────────────
+ 0    4      magic     "VXSL"
+ 4    2      slice_count    100
+ 6    2      strip_count    32
+ 8    2      leds_per_strip 24
+10    1      format         0x01 = 24-bit RGB
+11-15       reserved
+16   N*2304  切片数据       每片: 32strip × 24led × 3字节 RGB
+```
+
+### 文件结构
+
+```
+slice_player.h / .c  —— 新建
+  ├── SlicePlayer_Load(path)     从TF卡加载 .slices → 225KB AXI_SRAM缓冲
+  ├── SlicePlayer_RenderPhase(n)  memcpy(2304B) + WS2812_ShowFast()
+  ├── SlicePlayer_RenderNext()    相位自增 + 霍尔同步
+  └── SlicePlayer_OnHallEdge()   霍尔信号相位归零
+
+ws2812_driver.h / .c  —— 仅新增 1 个函数
+  └── WS2812_ShowFast()          使用 FillWave 合并编码 (~170µs)
+
+VolumeExporter.cs  —— 新增
+  └── ExportSlices()             对每相位跑投影 → 输出 .slices 文件
+  ```
+
+### 导出命令
+
+```bash
+VxDisplay.Exporter.exe model.stl --slices
+# 输出: model.bin + model.slices
+```
+
+### 主循环运行逻辑
+
+```
+main() 启动
+  ├── 加载 chiken.bin (体素模式保底)
+  ├── SlicePlayer_Load("model.slices")  ← 尝试切片模式
+  │     ├── 成功 → use_slices = 1
+  │     └── 失败 → use_slices = 0
+  │
+  └── while(1):
+        ├── BT_PollVoxelReady()     // 蓝牙体素数据
+        ├── BT_PollCommands()       // LOAD/LIST 延迟指令
+        │
+        ├── if (now - last >= s_phase_ticks):
+        │     ├── 更新相位间隔 (MotorControl)
+        │     ├── if use_slices:
+        │     │     SlicePlayer_RenderNext()
+        │     │       └── memcpy(2304B) + WS2812_ShowFast()
+        │     │             └── FillWave(170µs) → CleanCache → DMA(500µs)
+        │     └── else:
+        │     │     VolumeToWS2812_RenderNext()
+        │     │       ├── 32 strip × 24 led 遍历
+        │     │       ├── sin/cos 投影计算
+        │     │       ├── 768次 VolumeBuffer_GetVoxel
+        │     │       └── WS2812_Show()
+        │     │             └── FillBits(300µs) → Wave(200µs) → Encode(80µs) → DMA(500µs)
+        │     └── s_phase_count++
+        │
+        ├── if (1秒到):
+        │     └── 蓝牙上报: RPM PPS HPS SKP F S
+        │
+        └── GPIO EXTI 回调 (霍尔):
+              ├── VolumeHall_OnTrigger()
+              ├── MotorControl_ProcessHallTick()
+              ├── VolumeToWS2812_OnHallEdge()     // 体素模式相位归零
+              └── SlicePlayer_OnHallEdge()        // 切片模式相位归零
+
+UART4 回调 (命令处理):
+  HAL_UARTEx_RxEventCallback (空闲DMA收完)
+    ├── BT_ProcessCommand(data, size)
+    │     ├── :STATUS  → 即时回复 (ISR内)
+    │     ├── :DATA N  → bt_start_data_receive (ISR内切换DMA)
+    │     ├── :LOAD fn → 记录到 bt_cmd_pending (延迟)
+    │     └── :LIST    → 记录到 bt_cmd_pending (延迟)
+    │
+    ├── 若 BT_HasResponse() → TX_DMA 发送回复
+    └── 若 BT_IsReceiving() → 不重启空闲DMA (固定长度DMA已接管)
+
+  HAL_UART_RxCpltCallback (固定长度DMA收完)
+    └── BT_OnRxComplete → 发送 OK → 重启空闲DMA
+
+  HAL_UART_TxCpltCallback (发送完成)
+    └── 重启空闲DMA (HAL_UARTEx_ReceiveToIdle_DMA)
+```
+
+### 性能对比
+
+| 模式 | CPU/相位 | DMA | 总计 | 1000µs预算 | HPS |
+|------|:---:|:---:|:---:|:---:|:---:|
+| 体素(旧) | 650µs | 500µs | 1150µs | ❌ 超 | PPS/2 |
+| 切片(新) | 180µs | 500µs | 680µs | ✅ | ≈PPS |
+| 终极(理论) | 0 | 500µs | 500µs | ✅ | 2000 |
+
+## 切片加载 SD 卡读取卡死修复经验
+
+### 症状
+`SlicePlayer_Load` 中 `f_read` → `SD_read` → `while(ReadStatus == 0)` 死循环，
+和之前蓝牙指令 `:LOAD` / `:LIST` 完全相同的症状。
+
+### 排查过程
+
+| 尝试 | 结果 | 排除 |
+|------|:---:|------|
+| 拆成 8KB 小块读 | ❌ 仍卡死 | 非大块 DMA 问题 |
+| 移到 UART 启动前调用 | ❌ 仍卡死 | 非 ISR 中断干扰 |
+| 换 RAM_D2 + Cache 刷新 | ❌ 仍卡死 | 非内存区域问题 |
+| **FIL 放到 AXI SRAM + 完全照抄 SD_LoadStaticModel** | ✅ 解决 | 根因在此 |
+
+### 根因
+FatFS 的 `FIL` 结构内部包含文件指针、簇链、缓冲区指针等状态。
+`f_read` 会修改 FIL 内部字段。当 FIL 在栈 (DTCMRAM, 可缓存) 而
+FatFS 工作缓冲区 `SDFatFS.win` 在 AXI SRAM (不可缓存) 时，
+D-Cache 与 DMA 之间的缓存行共享导致 FIL 状态不一致，
+`f_read` 读到错误的簇链信息 → 请求不存在的扇区 → SDMMC DMA 永远不完成。
+
+`SD_LoadStaticModel` 正常正是因为它的 `FIL *fp = &g_static_file`
+指向 AXI SRAM 中的 FIL，与 FatFS 内部缓冲同一内存域，无缓存一致性问题。
+
+### 经验
+MCU 端所有 FatFS 操作 (f_open/f_read/f_write/f_close) 使用的
+**FIL 结构必须放在 AXI SRAM (非缓存区)**，禁止放栈或 DTCMRAM。
+`f_mount` 的 FATFS 结构同理。
+
+## 旋转模型
+
+切片模式旋转和体素模式完全一样，导出时在 PC 端完成：
+
+```bash
+# 绕 X 轴 90 度立起来 + 上轴 Y + 外壳 + 红色
+VxDisplay.Exporter.exe model.stl -r X,90 -u Y --slices --shell -c 255,30,30
+```
+
+旋转在体素化之前执行，切片自动继承旋转后的结果，MCU 端不用改。
+
+## WS2812 刷新率优化全记录
+
+### 初始问题
+
+POV 旋转显示改 100 片后，HPS 永远只有 PPS 的一半（HPS = SKP = PPS/2），
+无论转速高低，硬件刷新跟不上软件请求。
+
+### 排查过程与修复
+
+**第一阶段: DMA 模式切换**
+
+HPS = PPS/2 全程恒定，排除速度瓶颈。在 WS2812_Send 设置的
+`ws2812_busy_flag` 未能及时由 DMA 完成 ISR 清除。排查方向：
+1. DMA 流冲突? TIM1_UP=Stream2, TIM2_UP=Stream4, UART=Stream5+6 → 不冲突
+2. NVIC 优先级? DMA Stream2/4 均为 priority 0,0 (最高) → 正确
+3. 发现 `HAL_UART_AbortReceive` 未正确重置 RxState，导致后续
+   `HAL_UART_Receive_DMA` 返回 HAL_BUSY 静默失败。
+4. 同时 HAL 在 RxEventCallback 返回后自动重启空闲 DMA，覆盖新设的固定长度 DMA。
+   **修复**: 改用 `HAL_UART_DMAStop` + 设置 `ReceptionType = STANDARD`
+
+**第二阶段: CPU 编码耗时**
+
+BUS=1742µs 远超预估的 700µs。拆分测量: FILL=1067µs (FillWave+CleanCache)。
+526×32×24 = 18432 次逐位判断 + 对可缓存 RAM_D2 的密集写入占掉 1ms 以上。
+
+**第三阶段: Debug → Release + 预计算切片**
+
+逐步消除 CPU 计算:
+1. Debug→Release: FillBits 300→100µs (仅此一项不够)
+2. 切片预计算 (100 片×2304B = 225KB): 省掉 sin/cos 投影 + 768 次体素查找
+3. BSRR state 预计算 (最终方案): PC 端预计算 576 个 uint32_t 位片，
+   MCU 端只做 state→BSRR 展开 (576 次快速位运算)
+4. **最终结果**: FILL=169µs (<20% 预算), HPS=1015, SKP=0, 完美追平理论值
+
+### 最终架构 (slice_player + BSRR state)
+
+```
+┌─ PC 端 ─────────────────────────────────────────┐
+│ VxDisplay.Exporter.exe model.stl --slices       │
+│   体素化 → 100 相位投影 → 每相位 576 个位片     │
+│   ↓                                             │
+│   model.slices (225KB)                          │
+│     Header: "VXSL" + 32 + 24 + 0 + 100 + 0x02  │
+│     Data:  100 × 576 × 4B uint32_t LE 位片     │
+├─ TF 卡 ─────────────────────────────────────────┤
+│   chiken.slices (复制到卡)                      │
+├─ MCU 启动 ──────────────────────────────────────┤
+│   SlicePlayer_Load("chiken.slices")             │
+│     → f_read → 225KB 缓冲区 (AXI SRAM)          │
+│   use_slices = 1                                │
+├─ 主循环 (每相位 ~1000µs) ────────────────────────┤
+│   SlicePlayer_RenderNext()                      │
+│     └── WS2812_ShowFromSlice(位片指针)           │
+ 
+## 2026-05-15 调试记录：AnimV3 卡帧问题调查与处理
+简要：上电后 AnimV3 先刷新几帧然后长时间卡住，偶尔才推进一帧。排查并解决问题，最终通过增加 SD 异步读取块大小到 8192 字节并改进失败恢复策略解决。
+
+过程与修改：
+- 复现与观察：记录 BLE 周期性诊断（PPS/HPS/SKP/BUS/FILL/EXP/BR/F/SW/LD/LK/FR/MS/ER/FO），定位为 V3 的 SD 异步加载相关（v3_diag_* 增加）。
+- 尝试：逐步将 `SD_CHUNK` 从 512 → 2048 → 4096（测试），并在 `AnimV3` 中加入 `f_read` 重试（3 次）与快速重启异步加载的辅助函数，同时将 `V3_MAX_CONSEC_FAIL` 从 100 降到 8，加速恢复逻辑。
+- 最终用户端测试：将运行时 `SD_CHUNK` 改为 8192 后问题不再出现（稳定），因此取消进一步代码改动。
+
+结果：
+- 状态：问题已解决（用户验证稳定）。
+- 已保存更改：调试记录写入本文件；最终是否将代码合并到主分支由用户决定（当前用户表示无需再改动代码）。
+
+建议（可选后续项）：
+- 若需更稳健：将 `v3_expand_frame` 拆成多次分片展开以减少主循环阻塞；检查 NVIC 优先级、DMA/SDMMC 争用与电源稳定性；必要时尝试更高性能 SD 卡或卡座。
+
+记录人：GitHub Copilot（与用户协作）  日期：2026-05-15
+│           ├── fill_wave_from_state: 576×展开     │
+│           │     state → BSRR_B + BSRR_D (30µs)  │
+│           ├── CleanDCache (50µs)                │
+│           └── WS2812_Send() → DMA (500µs)       │
+│           总计: ~580µs < 1000µs ✅              │
+├─ 蓝牙上报 ──────────────────────────────────────┤
+│   RPM:608 PPS:1015 HPS:1015 SKP:0              │
+│   BUS:842 FILL:169 F:1 S:1                      │
+└─────────────────────────────────────────────────┘
+```
+
+### 性能演变
+
+| 阶段 | CPU/µs | DMA/µs | 总计/µs | PPS | HPS | SKP |
+|---|---|---|---|---|---|---|
+| 初始(体素+Debug) | 650 | 500 | 1150 | 696 | 348 | 348 |
+| FillWave(Debug) | 400 | 500 | 900 | — | — | — |
+| 切片RGB(Debug) | 400 | 500 | 900 | 946 | 473 | 473 |
+| 切片RGB(Release) | 1067 | 500 | 1567 | 992 | 496 | 496 |
+| **切片State(Release)** | **169** | **500** | **669** | **1015** | **1015** | **0** |
+
+### 关键经验
+
+1. FillWave 性能瓶颈在"RGB→GRB→逐位判断"的三重循环 (18432次)
+2. 预计算位片 (state) 是消除 CPU 瓶颈的最有效手段
+3. 切片文件大小不变 (2304 B/片)，不增加存储和 RAM 开销
+4. 切片模式下 TF 卡和蓝牙**零占用** CPU，瓶颈纯在 WS2812 编码+DMA
+
+---
+
+## 2026-05-08 工作记录
+
+### 1. 动画 V2 系统实现 (1-bit + 50片 + 180°对称)
+
+按照 new_convey.txt 规格文档完整实现了零停顿动画播放器。
+
+**PC 端:**
+- `VolumeExporter.cs` — 新增 `ExportSlicesV2()`: 1-bit 体素投影, 50片×96B=4.8KB/帧
+- `Program.cs` — 新增 `--format v2` 参数 + `WriteSliceFileV2()`: 写 format=0x03 头 (含调色板)
+- `merge_slices.py` — 支持 format=0x03 合并: 识别调色板、验证一致性、不同帧大小(4.8KB vs 225KB)
+- `batch_convert.py` — 新增 `--format v1|v2` 参数, v2 自动设 slice-count=50
+
+**MCU 端:**
+- `anim_player_v2.h/c` (新建) — 核心实现:
+  - `AnimV2_Load()`: 开机一次性 f_read 全部帧 → RAM_D2, 展开帧0
+  - `anim_v2_expand_frame()`: 1-bit → 576 mask words × 100 phases (含 __RBIT 反转预计算)
+  - `AnimV2_AdvanceFrame()`: 换帧 CPU 展开 ≈ 5374µs (实测), 零 SD 卡访问
+  - `AnimV2_RenderNext()`: 霍尔同步 + 渲染, 与旧版接口一致
+- `bt_commands.c` — CMD_LOAD 路由: V2 → V1 → 静态 三级回退
+- `main.c`:
+  - 启动加载: AnimV2_Load → AnimPlayer_Load → SlicePlayer 静态度
+  - 渲染优先级: AnimV2 → AnimPlayer → SlicePlayer → VolumeToWS2812
+  - 换帧: AnimV2_ProcessSwap() + AnimPlayer_ProcessSwap() 霍尔驱动
+  - **修复悬空 else bug**: 原代码 `if(Slice)_if(Anim)_...else_if(Slice)_...` 错误缩进
+  - 霍尔回调: +AnimV2_OnHallEdge()
+- `CMakeLists.txt` — 加入 anim_player_v2.c
+
+**数据对比:**
+
+|              | V1 动画 | V2 动画 |
+|--------------|---------|---------|
+| 每帧存储     | 225KB   | 4.8KB   |
+| 22帧大小     | 5MB     | 103KB   |
+| 换帧方式     | f_read 180ms | CPU展开 5.4ms |
+| 播放 CPU     | 169µs   | 169µs   |
+
+### 2. 静态炫彩 (colorize_slices.py)
+
+新建脚本, 对静态 .slices (format=0x02) 逐层着色:
+- 原理: 不改 header, 只改写 state mask word 分布
+- 5 种预设: dna(蓝→红) / rainbow(全色环) / ocean / fire / neon
+- 支持自定义 24 色文件 (R,G,B 每行)
+- 自动等比压缩到 --max-brightness (默认 35)
+- MCU 端零改动, 输出文件完全兼容
+
+### 3. 运行时控制
+
+**亮度控制:**
+- `:BRIGHT <1-100>` 蓝牙指令, 立即生效
+- 原理: 展开时调色板等比缩放
+- 状态上报 `BR:%u`, 默认 1% (用户设)
+
+**颜色控制:**
+- `:COLOR <r>,<g>,<b>` 蓝牙指令, 运行时换色
+- 立即重新展开当前帧
+
+**展开耗时测量:**
+- AnimV2_AdvanceFrame() 前后 DWT->CYCCNT 计时
+- 状态上报 `EXP:%lu` (µs), 实测 ~5374µs
+
+### 4. 上位机改进
+
+main.py 新增 "快捷指令" 输入框:
+- 支持直接发送 `:BRIGHT 50`、`:COLOR 255,0,0` 等任意指令
+- Enter 键发送, 发送后自动清空
+- 连接/断开/传输时自动管理按钮状态
+
+### 5. .gitignore 更新
+
+- 根目录 (stm32/): +.metadata/ +*.log +Python +OS
+- vx-display/: +.metadata/ +.venv/ +fbx_pipeline生成物 +日志
+
+### 6. 关键 Bug 确认
+
+- batch_convert.py --format v2 失败: 根因是旧版 exe 未重编译, 源代码已添加 --format 解析但二进制未更新
+- 180° 反转确认: 展开时 rev[led*24+k] = __RBIT(word), 渲染时直接 g_display_buf[phase*2304] 无需判断
+
+### 文件改动清单
+
+| 文件 | 状态 | 说明 |
+|------|------|------|
+| Core/user_code/anim_player_v2.h | 新建 | V2 播放器头文件 |
+| Core/user_code/anim_player_v2.c | 新建 | V2 播放器实现 |
+| Core/Src/main.c | 修改 | V2 渲染路径 + 启动 + 霍尔 + 修复bug |
+| Core/user_code/bt_commands.c | 修改 | CMD_LOAD 路由 + BRIGHT + COLOR |
+| CMakeLists.txt | 修改 | 加入 anim_player_v2.c |
+| VolumeExporter.cs | 修改 | +ExportSlicesV2() |
+| Program.cs | 修改 | +--format v2 + WriteSliceFileV2() |
+| fbx_pipeline/merge_slices.py | 修改 | format=0x03 支持 |
+| fbx_pipeline/batch_convert.py | 修改 | --format 参数 |
+| fbx_pipeline/colorize_slices.py | 新建 | 静态炫彩着色 |
+| upper_computer/main.py | 修改 | 快捷指令输入框 |
+| .gitignore (stm32/) | 修改 | 忽略 IDE/日志/Python |
+| .gitignore (vx-display/) | 修改 | 忽略 IDE/Python/生成物 |
+| instructions.txt | 新建 | 完整使用说明 |
+
+---
+
+## 2026-05-15 V3 6-bit 彩色动画 + TIM3 硬件相位触发
+
+### V3 6-bit 动画系统 (format=0x04)
+
+**目标**: 64色调色板, 每体素6-bit, 双缓冲零停顿换帧
+
+**PC 端:**
+- `VolumeExporter.cs` — ExportSlicesV3(): 6-bit packed (4体素→3字节), 按LED层分配颜色索引 (LED 0→1, LED 23→63)
+- `Program.cs` — `--format v3` + DefaultPalette64() + WriteSliceFileV3() (format=0x04, 64色调色板)
+- `merge_slices.py` — format=0x04 合并: 验证调色板一致性, 帧大小 28.8KB
+- `batch_convert.py` — `--format v3`, 自动设 slice-count=50
+- `colorize_slices.py` — process_slices_v3(): 改写192B调色板, 体素数据不动
+
+**MCU 端:**
+- `anim_player_v3.h/c` (新建) — V3 播放器:
+  - 双缓冲: front_buf/back_buf 各 112.5KB (复用 g_display_buf 225KB)
+  - 开机: f_read 同步加载帧0→front + 帧1→back
+  - 播放: f_read 512B分块加载 (PollAsyncLoad)
+  - 换帧: 指针交换 + back_ready 守卫
+  - 反向 phase 50-99: 实时 __RBIT (rev_slice 在 AXI SRAM)
+  - 展开: v3_expand_frame(), GRB bit 23→word[0] 映射匹配 ExportSlices
+  - 亮度上限: V3_MAX_CHANNEL=25, 调色板工作时缩放
+  - v3_dma_buf[29184] — 57扇区 (之前 28800 溢出 384B 导致 HardFault)
+
+**数据量对比:**
+
+| | V1 (state-packed) | V2 (1-bit) | V3 (6-bit) |
+|---|---|---|---|
+| 每帧 | 225KB | 4.8KB | 28.8KB |
+| 22帧 | 5MB | 103KB | 634KB |
+| RAM_D2 可存 | 1帧 | 48帧 | 9帧 |
+
+**展开耗时**: 实测 ~13.7ms (V2 1-bit 为 ~5.4ms), 6-bit per-voxel + 颜色查表增加开销
+
+### CubeMX TIM3 添加
+
+**CubeMX 配置**:
+- TIM3: PSC=239, ARR=999 (1MHz tick, 初始1000µs周期)
+- Clock Source: Internal Clock
+- Update Interrupt: 开启
+
+**CubeMX 覆盖恢复**:
+- `ffconf.h`: _USE_FIND 被重置为 0 → 恢复为 2
+- `sd_diskio.c`: 3处 `__DSB(); __ISB();` 被删除 → 恢复 (函数名从 CleanInvalidate 变为 Invalidate)
+
+**CubeMX 新增文件**:
+- `tim.h`: +htim3 extern, +MX_TIM3_Init()
+- `tim.c`: +TIM3 初始化代码
+- `stm32h7xx_it.h`: +TIM3_IRQHandler 声明
+- `stm32h7xx_it.c`: +TIM3_IRQHandler 实现 + USER CODE 渲染链
+
+### TIM3 硬件相位触发改造
+
+**架构变化:**
+```
+之前: 主循环轮询 DWT 计时器 → 到点渲染 → f_read 卡住 → 丢相位
+现在: TIM3 硬件定时中断 → ISR 直接渲染 → 主循环 f_read 随便卡
+```
+
+**中断优先级**:
+| 中断 | 优先级 | 用途 |
+|------|--------|------|
+| DMA1 (WS2812) | 0 | WS2812 波形 DMA |
+| EXTI9_5 (霍尔) | 0 | 霍尔传感器 |
+| SDMMC1 | 1 | SD卡 DMA 完成 |
+| TIM3 (相位) | 2 | 相位渲染触发 |
+| UART4 (BLE) | 3 | 蓝牙通信 |
+
+**stm32h7xx_it.c — TIM3 ISR**:
+- USER CODE Includes: +anim_player_v3.h, v2, anim_player, slice_player, volume_to_ws2812
+- ISR 内: 渲染链 V3→V2→V1→Slice→Volume + s_phase_count++
+
+**main.c 改动**:
+- 启动: `htim3.Instance->ARR = 1916; HAL_TIM_Base_Start_IT(&htim3)` 替代 s_phase_ticks
+- 主循环: 去掉 `if(now-last >= s_phase_ticks)` 相位轮询块
+- 主循环: 新增 `if(MotorControl_IsStable()) htim3.Instance->ARR = interval_us - 1`
+- `s_phase_count` 去掉 static (供 TIM3 ISR extern 引用)
+- 去掉 s_phase_ticks 变量
+
+**帧交换流程**:
+1. 霍尔 ISR (优先0) → AnimV3_OnHallEdge() → s_hall=1
+2. TIM3 ISR (优先2) → RenderNext → 检测 s_hall → s_phase=0, s_swap_pending=1
+3. 主循环 → ProcessSwap → AdvanceFrame:
+   - 检查 v3_back_ready (后缓冲是否就绪)
+   - s_swap_pending=0 (在 guard 之后)
+   - 关 TIM3 中断 → 交换指针 → 开 TIM3 中断
+   - f_lseek 定位下一帧 → 设 v3_sd_pending=1
+4. 主循环 → PollAsyncLoad: f_read(512B) 逐块读 → 读完展开 → back_ready=1
+
+### 已知问题 (未解决)
+
+**换帧失效**: 动画播放几帧后随机卡在某一帧不再切换。
+
+**已尝试的修复**:
+1. AdvanceFrame 去掉 `s_phase=0` (与 TIM3 ISR 竞争)
+2. `s_swap_pending=0` 移到 AdvanceFrame 守卫之后 (防止 back_ready=false 时标志丢失)
+3. TIM3 优先级从 1 改为 2 (低于 SDMMC)
+4. f_read 失败时回退重试 (替代直接放弃)
+5. AdvanceFrame 交换指针时关 TIM3 中断 (防止 ISR 读到半交换指针)
+
+**未排查的方向**:
+- FATFS 多文件同时打开 (_FS_LOCK=2, slice_fp + v3_fp)
+- f_lseek 跨簇时 FAT 读取可靠性
+- TIM3 ISR 与主循环的 v3_sd_buf 并发访问
+- s_hall/s_phase/s_swap_pending 多上下文 volatile 正确性
+
+**已修复**
+将f_read每次读取的tf卡中数据大小改大为8192B
+
+---
+
+## 2026-05-17 IS 交互粒子球 v3→v6 体素层重写
+
+### 初始问题
+
+v3 粒子球在 POV 显示上看起来像"多个圆环拼起来"而非光滑球体。
+
+诊断数据: RPM:536 PPS:896 IS_R:12 BR:30 US:6849 PRT:71/71
+
+根因: v3 生成 1 片面 → memcpy 50 次 → 所有面相同。每个粒子在每面都点亮 → LED 扫出完整圆环 → 71 粒子 = 71 个离散圆环。
+
+更深层原因: 球心在旋转轴上的球体在 POV 显示上本质就是同心圆环。因为每路 strip 到旋转轴的距离与相位角无关，旋转对称体素每面采样结果相同。
+
+### v4 — 体素层 + 100 面独立采样
+
+改写 is_expand_sphere: 粒子 → volume_draw_point → 体素缓冲区 → 100 面独立旋转采样 → state 数组。
+
+- 预计算存完整 3D 坐标 (x,y,z) 而非 2D 投影 (ds,dl)
+- 新增 led_buffer_to_state(): g_ledBuffer → 2304B WS2812 state 编码
+- 新增 q15_mul_round(): Q15 定点乘 (复用 volume_math 查表)
+- 去掉 __RBIT 路径，100 面直接查表
+- 后缓冲用 g_ramd2_buf (RAM_D1, 230KB)
+- 球心默认 x=18 (偏离旋转轴 2 单位) 以产生 3D 效果
+
+结果: 效果不理想。
+- 半球: sin_b<0 过滤了后半球粒子
+- 上下空: sin_a>0.7 外壳过滤去掉了极点粒子
+- 点太少: 200→71 粒子，体积裁剪后仅 24 个
+- EXP=107ms > 一圈时间(98.7ms): 100 面太慢，丢帧 40%
+
+### v5 — 50 面 + __RBIT + 全粒子 + 性能优化
+
+回到 50 面 + __RBIT 架构（球心在旋转轴，__RBIT 正确）。
+
+粒子: 去掉了 sin_a>0.7 (外壳) 和 sin_b<0 (前半球) 过滤，保留全部 200 粒子。
+
+性能优化:
+1. 50 面生成代替 100 面（减半）
+2. 去掉每面 memset(g_ledBuffer) — 列读取完全覆盖 strip 数据
+3. 一次性 memset 整个后缓冲 (115KB) — led_buffer_to_state 不再内部清零
+4. led_buffer_to_state 内 24-bit 循环完全展开 (常量掩码 if 判断)
+
+结果: RPM:610 PPS:1020 HPS:1020 SKP:0 IS_R:11 F:0x01 US:18265 PRT:200/200
+- EXP 从 107ms 降到 18ms（5.9 倍提升）
+- 200 粒子全绘，完整球面
+- HPS=PPS，无丢帧
+
+### v6 — 环形 (Torus/甜甜圈)
+
+用户选择做甜甜圈形状。
+
+形状: YZ 平面环面 (绕 X 轴)，大半径 R=8，小半径 r=3。
+- 参数方程: x=cx+r·cos(θ), y=cy+(R+r·sin(θ))·cos(φ), z=cz+(R+r·sin(θ))·sin(φ)
+- Golden-ratio 双角度采样，200 粒子均匀覆盖环面
+- 非旋转对称 → 每面截面不同 → 真正 3D 效果
+- x↔32-x 镜像对称 → __RBIT 正确
+
+亮度: 前方(cosφ>0) 亮于后方，外缘(|sinθ|) 亮于内缘。
+
+缩放: scale_den=100 (IS_RADIUS_DEFAULT×10)，默认缩放 1.0 → R=8,r=3 不变。
+
+形状切换: IS_SHAPE_TORUS / IS_SHAPE_SPHERE 一键切换。
+
+### 架构总结
+
+is_precompute()          → 粒子→3D坐标 (Fibonacci球或Golden-ratio环)
+is_expand_sphere()       → 体素绘制→50面旋转采样→state编码
+IS_Update()              → 双缓冲换帧 + 呼吸动画 + 摇杆交互
+IS_RenderNext()          → 前50面直接查表 + 后50面 __RBIT 反转
+WS2812_ShowFromSlice()   → state→BSRR→DMA→WS2812
+
+交互: J+/J-(缩放)、JT<n>(色温)、:BRIGHT n(亮度)、JE(退出)
+
+文件改动:
+| 文件 | 状态 | 说明 |
+|------|------|------|
+| Core/user_code/interaction_sphere.h | 修改 | v3→v6 API 不变 |
+| Core/user_code/interaction_sphere.c | 重写 | 体素层渲染 + 环形支持 |
+| Core/Src/main.c | 不变 | API 兼容 |
+| Core/Src/stm32h7xx_it.c | 不变 | IS_RenderNext 调用不变 |
+
+---
+
+## 2026-05-17 ~ 05-18 交互系统 v3→v6 + 画笔模式 工作总结
+
+### 一、IS 粒子球重写 (v3→v6)
+
+#### 问题诊断
+v3 粒子球在 POV 显示上呈现"多个圆环拼起来"效果。根因:
+- v3 只生成 1 片面 → memcpy 复制 50 份 → 所有相位面相同
+- 71 个粒子每个在每面都点亮 → LED 扫出 71 个完整圆环
+- 球心在旋转轴上 → 旋转对称 → 每面截面相同 → 无法呈现 3D 球体
+
+#### v4 — 体素层 + 100 面独立采样
+- 粒子 → volume_draw_point → 体素缓冲区 → 100 面独立旋转采样 → state 数组
+- 新增 `led_buffer_to_state()`: g_ledBuffer → 2304B WS2812 state 编码
+- 新增 `q15_mul_round()`: Q15 定点乘
+- 后缓冲用 g_ramd2_buf
+- 球心 x=18 (偏离旋转轴)
+
+结果: EXP=107ms > 一圈时间(98.7ms), 丢帧 40%
+- 半球: sin_b<0 过滤了后半球
+- 上下空: sin_a>0.7 过滤了极点
+- 点太少: 200→71→24 粒子
+
+#### v5 — 50 面 + __RBIT + 全粒子 + 性能优化
+- 回到 50 面 + __RBIT (球心在轴)
+- 去掉所有粒子过滤, 保留全部 200 粒子
+- 性能优化:
+  1. 50 面代替 100 面 (减半)
+  2. 去掉每面 memset(g_ledBuffer)
+  3. 一次性 memset 后缓冲, led_buffer_to_state 内部不置零
+  4. led_buffer_to_state 24-bit 循环完全展开 (常量掩码)
+
+结果: EXP 107ms→18ms (5.9x), HPS=PPS, 200 粒子全绘
+
+#### v6 — 甜甜圈 (Torus)
+- XY 平面环面, 绕 Z 轴旋转轴
+- 大半径 R=8, 小半径 r=3
+- 体素扫描填充 (非粒子): 遍历包围盒 + 环面方程检测
+- 环心偏移 x=18 (偏离旋转轴 2 单位, 每面截面不同)
+- Golden-ratio 双角度采样 (球体模式保留)
+- 6 色调色板, K 键切换颜色
+- `IS_CycleColor()` + `IS_COLOR_COUNT`
+
+### 二、画笔模式 (brush_mode)
+
+#### 架构
+```
+画布(颜色索引)→体素→50面采样→state (后50面 __RBIT)
+```
+
+#### 文件
+- `Core/user_code/brush_mode.h` — API 声明 (13 函数)
+- `Core/user_code/brush_mode.c` — 完整实现 (约 550 行)
+
+#### 核心功能
+
+**笔刷**: 2×2×2 体素, 边界保护
+**画布**: 24KB 颜色索引数组 (AXI SRAM), 值 0=空 1-6=颜料
+**光标**: 移模式=白色(12,12,6), 画模式=当前颜料色
+**闪烁**: 画模式亮暗交替(100%↔50%), 移模式亮灭交替
+
+**6 色颜料**:
+| 索引 | 颜色 | R | G | B |
+|------|------|---|---|---|
+| 0 | 红 | 30 | 0 | 0 |
+| 1 | 绿 | 0 | 30 | 0 |
+| 2 | 蓝 | 0 | 0 | 30 |
+| 3 | 黄 | 15 | 15 | 0 |
+| 4 | 青 | 0 | 15 | 15 |
+| 5 | 紫 | 15 | 0 | 15 |
+
+**霍尔相对坐标**:
+- 前(JU): 远离旋转轴, 方向由 JH<n> 视角偏移决定
+- 后(JD): 靠近旋转轴
+- 左(JL): 绕轴逆时针
+- 右(JR): 绕轴顺时针
+- 默认视角 A=0 (霍尔触发位置)
+
+**BLE 指令**: JL, JR, JU, JD, JB0, JB1, JP, JK, JH<n>, :BRUSH/BRUSH, :CLEAR/CLEAR, JE
+
+**ISR 渲染链优先级**: Brush > IS > AnimV3 > AnimV2 > AnimV1 > SlicePlayer > VolumeToWS2812
+
+#### 主循环集成 (main.c)
+- `Brush_Init()` — 启动初始化
+- `Brush_Update()` — 每帧: 换帧 + 落笔 + 生成下一帧
+- `Brush_HandleJoy()` — J 指令路由
+- `Brush_GetDiag()` — BLE 诊断输出
+- `Brush_ClearCanvas()` — 清画布
+- `Brush_CycleColor()` — 切颜色
+
+#### 诊断格式
+```
+BX:<X> BY:<Y> BZ:<Z> A:<视角> CL:<颜色> BTN:<按钮> DR:<画模式> US:<展开μs> SWP:<换帧> VOX:<体素数>
+```
+
+### 三、文件改动清单
+
+| 文件 | 状态 | 说明 |
+|------|------|------|
+| Core/user_code/interaction_sphere.h | 修改 | v3→v6 + IS_CycleColor |
+| Core/user_code/interaction_sphere.c | 重写 | 体素扫描甜甜圈 + 6色调色板 |
+| Core/user_code/brush_mode.h | 新建 | 画笔模式 API |
+| Core/user_code/brush_mode.c | 新建 | 画笔模式完整实现 |
+| Core/Src/main.c | 修改 | 7 处集成点 (Init/Update/ISR/BLE/EXTI/诊断) |
+| Core/Src/stm32h7xx_it.c | 修改 | TIM3 ISR 渲染链 + brush_mode.h |
+| CMakeLists.txt | 修改 | +brush_mode.c |
+| upper_computer/main.py | 修改 | 键盘映射 (WASD/Shift/P/C/K/[]/B/E) |
+| ble.txt | 新建 | BLE 指令完整参考 |
+| torus_preview.html | 新建 | 甜甜圈 3D 体素预览 |
+
+---
+
+## 2026-05-25 交互系统最终版本总结
+
+### 一、甜甜圈 (Torus) — v6 体素扫描版
+
+#### 设计
+- XY 平面环面, 绕 Z 轴 (旋转轴)
+- 大半径 R=8, 小半径 r=3
+- 环心偏移 x=18 (偏离旋转轴 2 单位 → 每面截面不同 → 动态 3D 效果)
+- 50 面 + __RBIT (对所有非对称内容均正确, 是 180° 几何映射)
+
+#### 渲染
+- **体素扫描填充**: 遍历包围盒每个体素, 检测环面方程 `(sqrt(x²+y²)-R)² + (z-cz)² ≈ r²`
+- 默认约 840 个体素填充环面
+- 带位置深度明暗着色
+
+#### 交互
+| 指令 | 功能 |
+|------|------|
+| J+/J- | 缩放 (半径 3-22) |
+| JK | 6色循环 (红/绿/蓝/黄/青/紫) |
+| JE | 退出 |
+
+#### 诊断
+```
+IS_R:10 T:0 BR:30 F:0x01 US:19992 PRT:840
+```
+EXP ~20ms, 840 体素/帧
+
+### 二、画笔模式 (Brush) — 完整 3D 绘画系统
+
+#### 架构
+```
+画布(颜色索引 0-6) → 体素 → 50面采样 → state (后50面 __RBIT)
+双缓冲 + 霍尔同步换帧
+```
+
+#### 文件
+- `Core/user_code/brush_mode.h` — 13 函数 API
+- `Core/user_code/brush_mode.c` — ~550 行完整实现
+
+#### 核心设计
+
+**画布**: 24KB 颜色索引数组 (AXI SRAM), 值 0=空, 1-6=颜料
+
+**笔刷**: 2×2×2 体素, 边界保护
+
+**6 色颜料** (R+G+B=30):
+| 索引 | 颜色 | R | G | B |
+|------|------|---|---|---|
+| 0 | 红 | 30 | 0 | 0 |
+| 1 | 绿 | 0 | 30 | 0 |
+| 2 | 蓝 | 0 | 0 | 30 |
+| 3 | 黄 | 15 | 15 | 0 |
+| 4 | 青 | 0 | 15 | 15 |
+| 5 | 紫 | 15 | 0 | 15 |
+
+**光标**: 移模式=白色(12,12,6), 画模式=当前颜料色
+**闪烁**: 画模式亮暗交替(100%↔50%), 移模式亮灭交替
+
+**霍尔相对坐标**:
+- 前(JU): 远离旋转轴, 方向由 JH<n> 视角偏移决定
+- 后(JD): 靠近旋转轴
+- 左(JL): 绕轴逆时针, 右(JR): 顺时针
+- 默认视角 A=0 (霍尔触发位置=前方)
+- [ ] 键旋转视角 ±90°
+
+#### BLE 指令全集
+
+**画笔移动**: JL/JR/JU/JD (步进 1 体素)
+**轴切换**: JB0=Y轴, JB1=Z轴
+**落笔**: JP (画⇄移)
+**颜色**: JK (6色循环)
+**视角**: JH<n> (0-99相位)
+**清屏**: CLEAR 或 :CLEAR
+**进入**: BRUSH 或 :BRUSH
+**退出**: JE
+
+#### 渲染链优先级
+```
+Brush > IS > AnimV3 > AnimV2 > AnimV1 > SlicePlayer > VolumeToWS2812
+```
+
+#### 诊断
+```
+BX:12 BY:8 BZ:12 A:0 CL:0 BTN:0 DR:1 US:20373 SWP:1512 VOX:372
+```
+
+### 三、V3 动画卡帧修复
+
+#### 问题
+DNA 大文件 (1125KB) 播放时 FR:24/556 次 f_read 失败
+
+#### 根因
+SD_CHUNK=8192 → 每帧 4 次 f_read → FAT 链频繁遍历
+
+#### 修复
+SD_CHUNK 8192 → 28800 (整帧一次读取), 彻底消除多段 f_read
+
+#### DNA 动画生成
+- `fbx_pipeline/gen_dna.py` — 数学曲线细线版
+- 双螺旋 2 条骨架 (1 体素细线) + 横档连接
+- 每帧 ~600 体素 (填充率 2.5%)
+- 可用参数: radius/turns/frames/rungs-per-turn
+
+### 四、上位机键盘映射
+
+#### 画笔模式
+| 键 | 指令 | 功能 |
+|----|------|------|
+| B | BRUSH | 进入画笔 |
+| WASD | JU/JL/JD/JR | 移动画笔 |
+| Shift | JB1/JB0 | Z轴模式切换 |
+| P | JP | 落笔/抬笔 |
+| K | JK | 切换颜料颜色 |
+| C | CLEAR | 清画布 |
+| [ ] | JH-25/JH+25 | 视角旋转 ±90° |
+| E | JE | 退出 |
+
+#### 甜甜圈模式
+| 键 | 指令 | 功能 |
+|----|------|------|
+| D | J+ | 放大 |
+| F | J- | 缩小 |
+| K | JK | 切换颜色 |
+| E | JE | 退出 |
+
+### 五、文件改动清单
+
+| 文件 | 状态 | 说明 |
+|------|------|------|
+| Core/user_code/interaction_sphere.h | 修改 | v3→v6 + IS_CycleColor |
+| Core/user_code/interaction_sphere.c | 重写 | 体素扫描甜甜圈 + 6色调色板 |
+| Core/user_code/brush_mode.h | 新建 | 画笔模式 API (11 函数) |
+| Core/user_code/brush_mode.c | 新建 | 画笔完整实现 (~550行) |
+| Core/user_code/anim_player_v3.c | 修改 | SD_CHUNK 28800 |
+| Core/Src/main.c | 修改 | 7 处集成点 |
+| Core/Src/stm32h7xx_it.c | 修改 | TIM3 ISR 渲染链 |
+| CMakeLists.txt | 修改 | +brush_mode.c |
+| upper_computer/main.py | 修改 | 键盘映射 |
+| fbx_pipeline/gen_dna.py | 新建 | DNA 螺旋 V3 动画生成器 |
+| ble.txt | 新建 | BLE 指令完整参考 |
+| torus_preview.html | 新建 | 甜甜圈 3D 体素预览 |
+
+---
+
+## 2026-05-26 贪吃蛇 3D 游戏
+
+### 设计目标
+在 32×32×24 体素空间中实现 3D 贪吃蛇，复用画笔模式的渲染管线。
+
+### 架构
+```
+蛇身(线性数组) + 食物(坐标数组) → 体素缓冲区 → 50面采样 → state → WS2812
+双缓冲 + 霍尔同步换帧, 每2霍尔走一步 (~5步/秒 @ 600RPM)
+```
+
+### 文件
+- `Core/user_code/snake_game.h` — API 声明
+- `Core/user_code/snake_game.c` — 完整实现 (~530行)
+
+### 核心设计
+
+**蛇身存储**: 线性数组 `snake_body[SNAKE_MAX_LEN]`, body[0]=头, body[len-1]=尾
+**移动**: `snake_move()` 整体右移腾出 [0] 给新头, `snake_pop_tail()` 仅 len--
+**碰撞检测**: `is_on_snake_body()` 检查 body[1]..body[len-2] 与 new_head 的 2×2×2 盒重叠
+**食物判定**: 同上, 2×2×2 盒重叠检测
+
+**转向**: 6 方向查表 `turn_table[6][4]`
+- XY 方向: JL/JR=旋转, JU=+Z, JD=-Z
+- Z 方向: JL/JR=旋转, JU/JD=返回XY
+- 禁止反向 (防立即撞死)
+
+**单元大小**: 2×2×2 (v2), 步长 2
+**颜色**: 蛇头=黄(30,30,0), 蛇身=绿(0,30,0), 食物=红(30,0,0)
+
+### 游戏规则
+| 项目 | 设定 |
+|------|------|
+| 初始长度 | 5 节 |
+| 食物数量 | 初始 10 个, 保持 ≥5 个, 初始 ≥3 在 XY 面 |
+| 速度 | 每 2 霍尔走一步 |
+| 穿墙 | 环绕 (坐标取模) |
+| 死亡 | 撞自己 → STATE:DEAD, 画面冻结 |
+| 开局 | JG 指令 |
+| 得分 | SCORE 字段回传 |
+
+### BLE 指令
+| 指令 | 功能 |
+|------|------|
+| `SNAKE` / `:SNAKE` | 进入贪吃蛇模式 |
+| `JG` | 开局/重新开始 |
+| `JL`/`JR`/`JU`/`JD` | 转向 (同画笔) |
+| `JE` | 退出 |
+
+### 诊断格式
+```
+SCORE:3 HIGH:5 STATE:PLAY LEN:8 DIR:0 H:(22,16,12) HIT:0 SP:150 SC:0 US:18000
+```
+
+### 踩坑记录
+
+**坑 1: ring buffer 数据布局与 push/pop 方向矛盾**
+- 症状: snake_reset 填 indices 0-4, push 向高 index 走, 碰撞检测向低 index 扫 → 扫到垃圾 → 第一步就"撞死"
+- 修复: 放弃 ring buffer, 改用线性数组 + `snake_move()` 整体右移
+
+**坑 2: 头尾方向反**
+- 症状: head_idx 指向低 X 端, 方向 +X, 第一步就踩到自己身体
+- 修复: head_idx=0 指向 body[0]=(16,16,12), 身体按 -X 排列
+
+**坑 3: snake_alive 非 volatile**
+- 症状: UART ISR 写入 1, 主循环读到编译器缓存的 0 → STATE 永远是 DEAD
+- 修复: 所有 ISR 访问变量加 volatile
+
+**坑 4: 2×2×2 食物判定用了旧单点比对**
+- 症状: 蛇走过食物, 食物不消失, 蛇不长大
+- 修复: 改为和碰撞一样的 `abs(diff) < SNAKE_CELL` 盒重叠
+
+### 渲染链优先级
+```
+Snake > Brush > IS > AnimV3 > AnimV2 > AnimV1 > SlicePlayer > VolumeToWS2812
+```
+
+### 文件改动清单
+| 文件 | 状态 | 说明 |
+|------|------|------|
+| Core/user_code/snake_game.h | 新建 | API (11 函数) |
+| Core/user_code/snake_game.c | 新建 | 完整实现 |
+| Core/Src/main.c | 修改 | 6 处集成 + :SNAKE 激活 |
+| Core/Src/stm32h7xx_it.c | 修改 | TIM3 ISR 渲染链 |
+| CMakeLists.txt | 修改 | +snake_game.c |
+| upper_computer/main.py | 修改 | G/N 键 + snake_mode 标志 |
+| ble.txt | 修改 | 贪吃蛇指令 + 诊断字段 |

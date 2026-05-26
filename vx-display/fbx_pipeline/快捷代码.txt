@@ -1,0 +1,62 @@
+//获取stl后批量改为slices文件
+python batch_convert.py frames_stl\*.stl --shell -r X,0 -c 255,100,100 --slice-count 100
+//blender控制台代码
+import os
+out_dir = r"C:\Users\1569\Desktop\stm32\vx-display\fbx_pipeline\frames_stl_valid"
+os.makedirs(out_dir, exist_ok=True)
+
+start = 0  # ← 改成实际起始帧
+end = 21     # ← 改成实际结束帧
+
+scene = bpy.context.scene
+for i, fno in enumerate(range(start, end + 1)):
+    scene.frame_set(fno)
+    bpy.ops.object.select_all(action="DESELECT")
+    for o in bpy.data.objects:
+        if o.type == "MESH":
+            o.select_set(True)
+    path = os.path.join(out_dir, f"frame_{i:03d}.stl")
+    bpy.ops.export_mesh.stl(filepath=path, use_selection=True, global_scale=1.0)
+    print(f"[{i+1}/{end-start+1}] 帧 {fno} → {path}")
+
+print("完成")
+
+# 1. 批量转换
+python batch_convert.py frames_stl_valid\*.stl --shell -r X,0 -c 255,100,100 --slice-count 100
+
+# 2. 合并为动画
+python merge_slices.py slices_out\*.slices -o anim.slices
+
+
+# DNA 科学渐变 (蓝->青->绿->黄->红, 默认)
+python colorize_slices.py DNA.slices -o DNA_dna.slices --max-brightness 20
+
+# 全色环彩虹
+python colorize_slices.py chiken.slices -o chiken_rainbow.slices --profile rainbow --max-brightness 20
+
+# 海洋渐变
+python colorize_slices.py chiken.slices -o chiken_ocean.slices --profile ocean
+
+# 火焰渐变
+python colorize_slices.py chiken.slices -o chiken_fire.slices --profile fire
+
+# 霓虹跳跃色
+python colorize_slices.py chiken.slices -o chiken_neon.slices --profile neon
+
+# 自定义颜色文件 (24行 R,G,B, 值域 0-255)
+python colorize_slices.py chiken.slices -o out.slices --colors my_colors.txt
+
+# 调整最大亮度 (默认 35, 自动等比压缩)
+python colorize_slices.py chiken.slices -o out.slices --max-brightness 50
+
+# V2 格式导出 (format=0x03, 50片, 1-bit)
+VxDisplay.Exporter.exe model.stl --slices --format v2 -c R,G,B
+
+# Step 2: 批量切片
+cd fbx_pipeline
+python batch_convert.py frames_stl_valid/*.stl --format v2 --shell -r X,0 -c 90,10,20
+# 输出: fbx_pipeline/slices_out/frame_*.slices
+
+# Step 3: 合并为多帧动画
+python merge_slices.py slices_out/*.slices -o anim.slices
+# 输出: fbx_pipeline/anim.slices (format=0x03)

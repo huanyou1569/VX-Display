@@ -1,0 +1,240 @@
+你是一个 STM32 嵌入式开发专家。请按照以下要求，帮我完成 VX-Diban 底版工程的代码重构和功能开发。
+
+---
+
+## 一、工程概况
+
+**项目路径**: `C:\Users\1569\Desktop\stm32\DAC+OLED+PWM(SDIO和TIM)\`
+
+**硬件平台**:
+- MCU: STM32F407VGT6 (Cortex-M4, 168MHz)
+- OLED: SSD1306 128x64, I2C1 (PB8=SCL, PB9=SDA)
+- 蓝牙: E104-BT52 BLE 模块, USART1 (PA9=TX, PA10=RX), 115200 baud
+- 摇杆: ADC1 (PA0=VRX, PA1=VRY), 按钮=KEY3 (PD5)
+- 按键: KEY2 (PC7)
+- SD卡: SDIO 1-bit
+- 音频: DAC1 (PA4), TIM6+DMA
+- 电机: TIM2 CH3 PWM (PA2), 测速=PD6 EXTI
+
+**DMA 中断优先级**:
+| 中断 | 优先级 | 用途 |
+|------|--------|------|
+| DMA1_Stream5 | 0 | DAC 音频 |
+| DMA2_Stream2 | 0 | USART1 RX |
+| DMA2_Stream3 | 0 | SDIO RX |
+| DMA2_Stream6 | 0 | SDIO TX |
+| DMA2_Stream7 | 0 | USART1 TX |
+
+**用户代码位置**: `Core/Src/` （需要拆分到 `Core/user_code/`）
+
+**已有模块（已完成，不要修改逻辑）**:
+- `oled.c/oled.h` — OLED 驱动 (SSD1306, 128x64, I2C)
+- `font.c/font.h` — ASCII 字体 (8x6/12x6/16x8/24x12) + 中文 16x16 + 图片
+- `audio_player.c/audio_player.h` — DAC+DMA 音频播放 (SD卡读取 .raw 文件)
+- `gpio.c` — 按键/摇杆按钮 EXTI 中断
+- `adc.c` — 摇杆 X/Y 轴 ADC 读取
+- `dac.c/dma.c/tim.c/usart.c/sdio.c/i2c.c` — HAL 外设初始化（CubeMX 生成，不要动）
+
+**构建系统**: CMake + Ninja + ARM GCC 13.3 (参考 `cmake/stm32cubemx/CMakeLists.txt`)
+
+---
+
+## 二、任务清单
+
+### 任务 1: 读懂代码并修复编译错误
+
+1. 先浏览 `Core/Src/main.c` 完整内容，理解现有代码结构
+2. 尝试编译 (`cmake --build build/Debug`)，修复所有编译错误和警告
+3. 注意：`main.c` 的 USER CODE 区域可能混乱，小心不要破坏 CubeMX 生成的代码结构（`USER CODE BEGIN/END` 标记之间的代码可以修改，标记外的不要动）
+
+### 任务 2: 拆分 main.c 到 user_code 模块
+
+在 `Core/` 下新建 `user_code/` 文件夹，将 main.c 中的用户逻辑拆分为以下模块文件，每个模块一个 `.c` + `.h`：
+
+```
+Core/user_code/
+  ui_menu.c / ui_menu.h          — 所有 OLED 菜单界面绘制函数
+  ui_input.c / ui_input.h        — 摇杆/按键输入处理和菜单导航
+  motor_control.c / motor_control.h — 电机 PWM 控制 + 转速测量
+  audio_control.c / audio_control.h — 音频播放控制封装
+  ble_handler.c / ble_handler.h  — 蓝牙 AT 指令收发和解析
+  sd_file.c / sd_file.h          — SD 卡文件浏览
+  app_state.c / app_state.h      — 全局应用状态 (当前菜单、标志位等)
+```
+
+**拆分原则**:
+- main.c 的 while(1) 主循环只需调用各模块的函数
+- 每个模块的 `.h` 文件声明公开函数，`.c` 实现
+- 全局状态变量放到 `app_state.h` 用 `extern` 声明，在 `app_state.c` 定义
+- OLED 显示使用现有的 `OLED_PrintASCIIString`、`OLED_PrintString` 等函数
+- **所有 OLED 显示内容用英文和数字，不要用中文**（中文字符没有取模）
+
+**编码风格**:
+- 函数命名: `PascalCase` (如 `DrawMainMenu`, `HandleJoystickInput`)
+- 变量命名: `snake_case` (如 `menu_index`, `is_playing`)
+- 缩进: 2 空格
+- 注释用 `//`，简单英文说明功能即可
+- 头文件保护: `#ifndef __MODULE_NAME_H__` / `#define __MODULE_NAME_H__`
+
+### 任务 3: 蓝牙文件传输和状态查询
+
+在你的 OLED 主菜单的 **Bluetooth** 子菜单下，新建以下子菜单项：
+
+```
+Bluetooth
+  ├── Status Query     → 发送 :STATUS\n, 接收并解析回传数据显示在 OLED 上
+  ├── List Files       → 发送 :LIST\n, 接收文件名列表, 显示在 OLED 上
+  └── Switch File      → 发送 :LOAD <filename>\n, 显示加载结果
+```
+
+**BLE 通信协议** (USART1, 115200 8N1):
+```
+发送格式: ASCII 文本, 每指令一行, 结尾 \n
+接收格式: 空闲中断 + DMA, 可变长度接收
+指令集:
+  :STATUS\n         → 响应: RPM:313 DLY:3834 F:1 S:1\n
+  :LIST\n           → 响应: 文件名列表, 以 END 结尾
+  :LOAD <文件名>\n  → 响应: OK 或 ERR
+```
+
+**USART1 接收方式**: 使用 `HAL_UARTEx_ReceiveToIdle_DMA` 进行不定长接收（和 vx-display 主机的 UART4 一样的方式）
+
+**数据结构**: 定义一个环形缓冲区存储接收到的 BLE 数据，在主循环中逐行解析
+
+### 任务 4: 交互子菜单（甜甜圈 + 画笔）
+
+在 OLED 主菜单下新建 **Interact** 子菜单（和 Bluetooth 同级）：
+
+```
+Interact
+  ├── Donut            → 进入甜甜圈模式
+  │     ├── Zoom In    → 发送 J+\n
+  │     ├── Zoom Out   → 发送 J-\n
+  │     ├── Color      → 发送 JK\n (切换颜色, 6色循环)
+  │     └── Exit       → 发送 JE\n
+  │
+  └── Brush            → 进入画笔模式
+        ├── Move       → 摇杆控制移动 (发送 JL/JR/JU/JD)
+        ├── Draw/Stop  → 发送 JP\n (落笔/抬笔切换)
+        ├── Z-Axis     → 发送 JB1\n (按住时) / JB0\n (松开时)
+        ├── Color      → 发送 JK\n (切换颜料, 6色循环)
+        ├── Clear      → 发送 :CLEAR\n
+        ├── Angle      → 发送 JH<n>\n (视角偏移)
+        └── Exit       → 发送 JE\n
+```
+
+**画笔 Move 子菜单**:
+- 进入后摇杆上下左右实时发送 JL/JR/JU/JD
+- OLED 显示当前坐标 (从回传数据 BX/BY/BZ 解析)
+- KEY2 按钮 = Z 轴切换 (按住发送 JB1, 松开发送 JB0)
+- KEY3 按钮 = 落笔/抬笔 (发送 JP)
+
+**画笔 Color 子菜单**:
+- OLED 显示 6 色选项 (Red/Green/Blue/Yellow/Cyan/Purple)
+- 摇杆上下选择，KEY3 确认 → 发送对应次数的 JK（或记住当前颜色索引）
+
+### 任务 5: 更新 CMakeLists.txt
+
+在 `cmake/stm32cubemx/CMakeLists.txt` 的 `add_library` 中添加所有新建的 `Core/user_code/*.c` 文件。
+
+### 任务 6: 创建 launch.json
+
+在 `.vscode/` 下创建 `launch.json`，参考 `BUILD_GUIDE.txt`：
+
+```json
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "STM32F4 Debug",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/Debug/DAC+OLED+PWM.elf",
+            "request": "launch",
+            "type": "cortex-debug",
+            "runToEntryPoint": "main",
+            "servertype": "openocd",
+            "configFiles": ["interface/stlink.cfg", "target/stm32f4x.cfg"],
+            "device": "STM32F407VG",
+            "svdFile": "",
+            "showDevDebugOutput": "raw",
+            "preLaunchTask": "Build"
+        }
+    ]
+}
+```
+
+### 任务 7: 注释颜色
+
+在 `.vscode/settings.json` 中添加或修改：
+```json
+{
+  "editor.tokenColorCustomizations": {
+    "textMateRules": [{
+      "scope": "comment",
+      "settings": { "foreground": "#00AA00" }
+    }]
+  }
+}
+```
+
+---
+
+## 三、重要提醒
+
+1. **不要修改 CubeMX 生成的代码标记之外的区域**（`USER CODE BEGIN/END` 之间可以改）
+2. **OLED 所有文字用英文+数字**，绝不用中文（字库不完整）
+3. **蓝牙发送函数**需要检查 USART1 TX DMA 是否空闲再发送，参考 vx-display 项目的 `HAL_UART_Transmit_DMA` 用法
+4. **蓝牙接收**用空闲中断 + 环形缓冲区，在主循环中逐行解析
+5. **摇杆 ADC 读取**已有代码在 main.c 中，直接复用
+6. **编译测试**: 每完成一个模块就编译一次，确保没有引入新错误
+7. **不要引入未使用的变量/函数，消除所有编译警告**
+
+---
+
+## 四、BLE 完整指令速查
+
+请参考项目根目录下的 `ble.txt` 文件。如果找不到，以下是核心指令：
+
+```
+设备查询:
+  :STATUS        → 状态查询
+  :LIST          → 文件列表
+
+文件操作:
+  :LOAD <文件名> → 加载文件
+
+甜甜圈控制:
+  J+ / J-        → 缩放
+  JK             → 切换颜色
+  JE             → 退出
+
+画笔控制:
+  JL / JR        → 左右移动
+  JU / JD        → 前后/上下移动
+  JB0 / JB1      → Z轴切换
+  JP             → 落笔切换
+  JK             → 切换颜料
+  JH<n>          → 视角偏移 (0-99)
+  :CLEAR         → 清屏
+  JE             → 退出
+
+回传数据格式 (MCU 每秒自动发送):
+  RPM:xxx PPS:xxx HPS:xxx SKP:xxx BUS:xxx FILL:xxx F:xxx S:xxx ...
+  (画笔模式附加: BX:xx BY:xx BZ:xx A:xx CL:xx BTN:xx DR:xx ...)
+```
+
+---
+
+## 五、期望交付
+
+完成后，工程应满足：
+1. `main.c` 主循环简洁清晰，只调用各模块函数
+2. `Core/user_code/` 下有完整的模块文件
+3. 编译零错误零警告
+4. OLED 菜单可以正常导航，蓝牙子菜单可以发送指令并显示回传数据
+5. 交互子菜单可以控制 VX-Display 主机的甜甜圈和画笔
+6. `CMakeLists.txt` 已更新
+7. `.vscode/launch.json` 可用的调试配置
+8. 注释颜色为绿色
+
+请开始工作，先通读所有现有代码，然后分步完成任务。

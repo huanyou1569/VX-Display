@@ -1,0 +1,231 @@
+# 6-bit 真彩动画优化方案 —— 全设计文档
+
+## 目标
+6-bit (64色) 稀疏 per-strip 体素存储 + 50片双缓冲 + 异步DMA流式加载
+实现: 64色独立体素配色, 每帧14.6KB, 零停顿换帧, CPU不阻塞
+
+## 当前状态 (V2 1-bit)
+- 格式: 1-bit 体素 + 全局调色板 (format=0x03)
+- 每帧: 50片 × 96B = 4.8KB
+- 展开: 100片(正向+__RBIT反转预计算) → g_display_buf 225KB
+- 展开耗时: ~5.4ms
+- 换帧: CPU写g_display_buf (DMA可能读到半成品, 5.4ms窗口)
+- 缓冲: 单缓冲, g_display_buf 225KB
+
+## 新方案 (6-bit 稀疏 per-strip)
+
+### 核心理念
+1. 只存储亮的体素 (稀疏编码, ~20% 占空比)
+2. 每个体素独立 6-bit 颜色索引 (64色调色板)
+3. 50片双缓冲 (前缓冲A读, 后缓冲 CPU写)
+4. 反向 50 片实时计算 (__RBIT, 不在缓冲中预存)
+5. SD卡异步DMA流式加载 (CPU不阻塞)
+
+### 数据量
+
+```
+每片稀疏数据: ~150 体素 × 2字节 = 300 字节
+每帧: 50片 × 300 = 15,000 字节 ≈ 14.6KB
+调色板: 64 × 3 = 192 字节 (全局, 非每帧)
+```
+
+### 新文件格式 (format=0x04)
+
+```
+16 字节头:
+  0: magic[4]    = "VXSL"
+  4: strips[2]   = 32
+  6: leds[2]     = 24
+  8: depth[2]    = 50
+ 10: frames[2]   = N
+ 12: format[1]   = 0x04      (6-bit 稀疏 per-strip)
+ 13: reserved[1]
+ 14: palette_count[2] = 64
+ 16 字节头结束
+
+192 字节调色板 (紧接头):
+  palette[64][3]: R,G,B 各1字节, 共192字节
+  索引0=全灭(预留), 索引1-63=实际颜色
+
+每帧数据 (N帧, 稀疏编码):
+
+  帧头 (4字节):
+    0: total_voxels[2]   该帧总亮体素数
+    2: slice_count[1]    片数 (=50)
+    3: reserved[1]
+
+  片索引 (50 × 2字节 = 100字节):
+    slice_off[0..49]:    每片的体素偏移 (uint16, 相对帧数据起始)
+                         片i的体素数 = slice_off[i+1] - slice_off[i]
+
+  体素数据 (total_voxels × 2字节):
+    每个体素打包为 2 字节:
+      bits[0:4]   = strip (5bit, 0-31)
+      bits[5:9]   = led   (5bit, 0-23)
+      bits[10:15] = color (6bit, 0-63)
+
+  总帧大小: 4 + 100 + total_voxels × 2 字节
+  典型: 4 + 100 + (50×150)×2 = 4 + 100 + 15000 = 15104 ≈ 14.8KB
+
+合并后文件总大小: 16 + 192 + N × 帧大小
+```
+
+### 缓冲布局
+
+```
+AXI SRAM (512KB):
+  ┌──────────────────┬──────────────────┬────────────────┐
+  │ 前缓冲 112.5KB    │ 后缓冲 112.5KB    │ ws2812/FatFS   │
+  │ (DMA读, 当前帧)   │ (CPU写, 下一帧)   │ /其他 ~287KB   │
+  └──────────────────┴──────────────────┴────────────────┘
+       50片正向state       50片正向state
+       刚好 225KB = g_display_buf 原大小, 不动缓冲声明
+
+RAM_D2 (288KB):
+  ┌────────────────────────────┬──────────────────┐
+  │ 预加载帧缓存 (可放 ~17帧)   │ rx_data/tx_buf   │
+  │ 14.6KB × 17 = 248KB       │ ~0.5KB           │
+  │                            │ 剩余 ~39KB       │
+  └────────────────────────────┴──────────────────┘
+
+  或异步流式: RAM_D2 只存 2-3 帧中转 (溜冰缓冲)
+  ┌──────┬──────┬──────┬─────────────────────────┐
+  │ 帧N  │ 帧N+1│ 帧N+2│ rx/tx + 展开中转         │
+  │14.6KB│14.6KB│14.6KB│ ~240KB 空闲              │
+  └──────┴──────┴──────┴─────────────────────────┘
+```
+
+### 渲染流程
+
+```
+主循环 (每 1000µs 相位预算):
+
+  phase 0-49 (正向):
+    AnimV2_RenderPhase(phase):
+      state = 前缓冲 + phase × 2304
+      WS2812_ShowFromSlice(state) ← DMA 读前缓冲
+
+  phase 50-99 (反向, 实时计算):
+    AnimV2_RenderPhase(phase):
+      读前缓冲片 (phase-50) 的 576 个 mask word
+      逐 word __RBIT 反转
+      存入 RAM_D2 临时缓冲 (1片 = 2304B)
+      WS2812_ShowFromSlice(临时缓冲) ← DMA 读 RAM_D2
+
+  注意: phase 50-99 每片需要 __RBIT 576 次 ≈ 2µs (可忽略)
+
+换帧 (每圈, 霍尔触发):
+  s_swap_pending = 1
+  主循环 ProcessSwap():
+    如果后缓冲已展开好:
+      交换前后指针 (0µs)
+      开始异步展开下一帧到新的后缓冲
+    否则:
+      跳过 (等下一圈)
+```
+
+### 展开算法
+
+```
+anim_v3_expand_frame(sparse_data, total_voxels, palette[64], state_buf):
+  1. memset(state_buf, 0, 50 × 2304)  ← 清零 50 片正向
+
+  2. 解析片索引 → 得到每片的体素偏移和数量
+
+  3. 遍历每片的体素:
+     for voxel in sparse_data:
+       strip = voxel[0:4]
+       led   = voxel[5:9]
+       color = voxel[10:15]
+       (r,g,b) = palette[color]
+       grb = (g<<16)|(r<<8)|b
+
+       for each bit in grb (0-23) that is 1:
+         state[slice][led*24 + bit] |= (1 << strip)
+
+  4. 展开 50 片正向总计: ~150 × 50 = 7500 体素
+     每体素: 查颜色 + 解码 + ~3 bit 写入 ≈ 1µs
+     总计: ~7.5ms (比 V2 1-bit 的 5.4ms 略多, 因为有颜色查表)
+
+注: 只展开 50 片正向, 反向 50 片在渲染时实时 __RBIT 计算
+```
+
+### SD 卡异步 DMA 流式加载
+
+```
+使用 HAL_SD_ReadBlocks_DMA (非阻塞):
+  1. f_lseek 到目标帧的文件偏移
+  2. 计算帧数据占用的物理扇区 (FAT→扇区号)
+  3. HAL_SD_ReadBlocks_DMA(buf, sector, count) → 立即返回
+  4. CPU 继续主循环
+  5. SDMMC IDMA 后台搬数据
+  6. 传输完成 → HAL_SD_RxCpltCallback → sd_async_done = 1
+  7. 主循环检查 sd_async_done → memcpy 到 RAM_D2 → 展开到后缓冲
+
+关键注意事项:
+  - AXI SRAM 中转缓冲 (~16KB, 够一帧)
+  - 双倍 ping-pong 避免覆盖 (块A DMA写入时, 块B CPU处理)
+  - FatFS f_lseek 可用 (只读 FAT 表, 不读数据, 很快)
+  - 自己的扇区映射: f_lseek → FIL.fptr → FAT遍历 → 物理扇区
+    或直接用 FatFS fast seek (_USE_FASTSEEK)
+  - DMA 总线竞争: SDMMC IDMA写 + TIM DMA读, 仲裁延迟 5-15ns, 忽略不计
+  - WS2812 DMA 从 AXI SRAM 读, SDMMC IDMA 写到中转缓冲(也AXI SRAM)
+    不同区域不冲突
+```
+
+---
+
+## 实现清单
+
+### PC 端修改
+
+1. **VolumeExporter.cs**: 新增 `ExportSlicesV3()`
+   - 输入: volume[32×32×24], palette[64][3], 模型颜色映射
+   - 对每相位投影 → 记录哪些体素亮 + 颜色索引
+   - 输出: 稀疏编码字节数组
+
+2. **Program.cs**: 新增 `--format v3` + `WriteSliceFileV3()`
+   - 写 format=0x04 header + 64色调色板
+   - 写每帧: 帧头 + 片索引 + 体素数据
+
+3. **merge_slices.py**: 支持 format=0x04 合并
+   - 验证调色板一致性
+   - 帧数据直接拼接
+
+4. **batch_convert.py**: v3 格式支持
+   - --format v3 → 传递到导出器
+
+### MCU 端修改
+
+5. **anim_player_v3.h** (新建)
+   - 常量: ANIM_V3_SLICE_COUNT=50, SPARSE_HEADER=4, SLICE_INDEX=100
+   - API: Load / RenderPhase / RenderNext / AdvanceFrame / IsActive
+
+6. **anim_player_v3.c** (新建)
+   - 双缓冲指针: front_buf / back_buf (各 112.5KB)
+   - anim_v3_expand_frame(): 6-bit 稀疏 → 50片正向 state
+   - AnimV3_Load(): 读取头+调色板 → 可选预加载N帧或流式
+   - AnimV3_AdvanceFrame(): 指针交换 + 异步启动下一帧加载
+   - sd_async_read_frame(): 异步DMA f_read一帧
+
+7. **bt_commands.c**: CMD_LOAD 增加 format=0x04 路由
+   - V3 → V2 → V1 → 静态回退链
+
+8. **main.c**: V3 渲染路径 + 启动加载
+   - 优先级: V3 → V2 → V1 → 静态
+
+9. **CMakeLists.txt**: 加入 anim_player_v3.c
+
+### 待确认问题
+
+1. 模型颜色映射怎么定义?
+   - 方案A: STL 文件自带颜色 (需导出器支持彩色STL)
+   - 方案B: 24层各一个颜色 (和静态炫彩一样)
+   - 方案C: 按体素空间位置自动生成 (高/中/低→不同色)
+
+2. 先做全预加载还是直接做异步流式?
+   - 预加载: 简单, 17帧够用, 先跑通彩色
+   - 异步流式: 复杂, 但无限帧数
+
+3. RBIT 反向渲染用 RAM_D2 中转 — 确认 WS2812 DMA 从 RAM_D2 读可行?
+   (之前 anim_player V1 已经验证过: DMA 读 RAM_D2 的 back_buf 可以)

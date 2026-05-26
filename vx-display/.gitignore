@@ -1,0 +1,75 @@
+# Build output
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.dir/
+
+# Generated binaries and artifacts
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.o
+*.obj
+*.a
+
+# Local IDE / editor files
+.vscode/
+mx.scratch
+.idea/
+
+# Eclipse IDE metadata
+.metadata/
+
+# Environment & secrets
+.env
+.env.*
+.env.local
+.env.*.local
+*.env
+!*.env.example
+credentials.json
+secrets.yaml
+secrets.yml
+*.pem
+*.key
+!Makefile
+
+# Python virtual environment
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# PyInstaller
+*.spec
+
+# OS generated files
+.DS_Store
+Thumbs.db
+*.tmp
+*~
+
+# C# build output
+RuiJi.Slice-master/**/bin/
+RuiJi.Slice-master/**/obj/
+
+# Generated pipeline artifacts
+fbx_pipeline/frames_stl*/
+fbx_pipeline/slices_out/
+fbx_pipeline/*.slices
+fbx_pipeline/*.bin
+
+# Log files
+*.log
+
+# Keep CubeMX project files unless you explicitly want to ignore them
+!.settings/

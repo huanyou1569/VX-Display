@@ -1,0 +1,238 @@
+# STM32F407 VX-Diban 项目构建与调试配置指南
+
+## 一、项目概况
+
+- MCU: STM32F407VGT6
+- 项目名: vx-diban
+- 构建系统: CMake + Ninja
+- 工具链: GNU Tools for STM32 (arm-none-eabi-gcc 13.3)
+- 调试器: ST-Link (SWD) + OpenOCD
+- IDE: VSCode + STM32Cube IDE 扩展
+
+## 二、关键文件路径
+
+```
+项目根目录: C:/Users/1569/Desktop/stm32/vx-diban/
+
+工具链:
+  ARM GCC:   D:/Development Environment/DevEnv/GNU-tools-for-STM32/bin/arm-none-eabi-gcc.exe
+  OpenOCD:   D:/Development Environment/DevEnv/openocd-v0.12.0-i686-w64-mingw32/bin/openocd.exe
+  cmake:     系统 PATH 中的 cmake (version 4.2.3)
+
+CMake 工具链文件:
+  cmake/gcc-arm-none-eabi.cmake    (项目自带, CubeMX生成)
+
+VSCode 配置:
+  .vscode/settings.json
+  .vscode/launch.json
+  .vscode/tasks.json
+  .vscode/c_cpp_properties.json
+```
+
+## 三、CMake 配置
+
+### 3.1 工具链文件 (cmake/gcc-arm-none-eabi.cmake)
+
+项目自带工具链文件, 内容要点:
+```
+CMAKE_SYSTEM_NAME = Generic       # 裸机系统
+CMAKE_SYSTEM_PROCESSOR = arm      # ARM处理器
+CMAKE_C_COMPILER = arm-none-eabi-gcc
+CMAKE_TRY_COMPILE_TARGET_TYPE = STATIC_LIBRARY   # 必须! 避免链接测试失败
+TARGET_FLAGS = -mcpu=cortex-m4 -mfpu=fpv4-sp-d16 -mfloat-abi=hard
+EXE_LINKER_FLAGS 包含:
+  -T "STM32F407XX_FLASH.ld"       # 链接脚本
+  --specs=nano.specs               # newlib-nano
+  -Wl,--gc-sections               # 去除未用段
+  -Wl,--print-memory-usage        # 打印内存使用
+```
+
+### 3.2 首次配置命令
+
+在项目根目录执行:
+
+```bash
+mkdir build
+cd build
+cmake -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_TOOLCHAIN_FILE=../cmake/gcc-arm-none-eabi.cmake \
+  ..
+```
+
+### 3.3 常见配置错误
+
+**错误1: 用主机编译器配置 (报 _WIN32 冲突)**
+- 现象: 编译时出现 `windows.h`、`winnt.h` 冲突, `ERROR = !SUCCESS` 重定义
+- 原因: 没有指定 `-DCMAKE_TOOLCHAIN_FILE`, cmake 用了主机 MinGW/gcc
+- 解决: 删除 build 目录, 重新带 toolchain file 配置
+
+**错误2: 用 cmake 而不是 cube-cmake**
+- settings.json 中配置了 `"cmake.cmakePath": "cube-cmake"`
+- cube-cmake 是 STM32Cube IDE 扩展提供的 cmake 封装, 不在系统 PATH
+- 命令行配置直接用系统 cmake + 工具链文件即可
+- VSCode 的 CMake Tools 扩展使用 cube-cmake; 命令行 shell 任务用系统 cmake
+
+**错误3: 链接测试失败**
+- 工具链文件中 `CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY` 是关键
+- 没有这一行会导致 cmake 尝试链接成 .exe (Windows PE), 而 ARM bare-metal 链接需要 .elf 格式
+
+### 3.4 编译命令
+
+```bash
+cd build
+ninja
+```
+
+产物: `build/vx-diban.elf` 和 `build/vx-diban.map`
+
+## 四、VSCode 调试配置
+
+### 4.1 launch.json (.vscode/launch.json)
+
+```json
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "STM32F407 BLE Host Debug",
+            "type": "cortex-debug",
+            "request": "launch",
+            "cwd": "${workspaceFolder}",
+            "executable": "${workspaceFolder}/build/vx-diban.elf",
+            "servertype": "openocd",
+            "serverpath": "D:/Development Environment/DevEnv/openocd-v0.12.0-i686-w64-mingw32/bin/openocd.exe",
+            "device": "STM32F407VGTx",
+            "configFiles": [
+                "D:/Development Environment/DevEnv/openocd-v0.12.0-i686-w64-mingw32/share/openocd/scripts/interface/stlink.cfg",
+                "D:/Development Environment/DevEnv/openocd-v0.12.0-i686-w64-mingw32/share/openocd/scripts/target/stm32f4x.cfg"
+            ],
+            "svdFile": "STM32F407.svd",
+            "preLaunchTask": "CMake: Build",
+            "runToEntryPoint": "main"
+        }
+    ]
+}
+```
+
+关键字段说明:
+- `type`: `cortex-debug` — 需要安装 VSCode 扩展 "Cortex-Debug"
+- `executable`: 指向 elf 文件, 注意 build 产物直接生成在 `build/` 根目录, 不在 `build/Debug/`
+- `serverpath`: **绝对路径**指向 openocd.exe, 因为 openocd 不在系统 PATH
+- `configFiles`: **绝对路径**指向 cfg 文件, openocd 需要 interface 和 target 两个 cfg
+- `preLaunchTask`: 调试前自动执行构建任务, 对应 tasks.json 中的 `"label": "CMake: Build"`
+- `svdFile`: STM32F407.svd 文件需要放在项目根目录或指定路径 (用于外设寄存器查看)
+
+### 4.2 tasks.json (.vscode/tasks.json)
+
+```json
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "CMake: Build",
+            "type": "shell",
+            "command": "ninja",
+            "options": {
+                "cwd": "${workspaceFolder}/build"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "problemMatcher": ["$gcc"],
+            "detail": "Ninja build (ARM toolchain)"
+        },
+        {
+            "label": "CMake: Configure",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "-G", "Ninja",
+                "-DCMAKE_BUILD_TYPE=Debug",
+                "-DCMAKE_TOOLCHAIN_FILE=../cmake/gcc-arm-none-eabi.cmake",
+                ".."
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/build"
+            },
+            "detail": "CMake configure with ARM toolchain"
+        }
+    ]
+}
+```
+
+注意:
+- 构建任务直接调用 `ninja` 而不是 `cmake --build`, 因为后者可能意外触发重新配置
+- 构建任务的工作目录必须是 `build/` (CMake 配置目录)
+- 配置任务单独列出来, 只在需要时手动运行
+
+### 4.3 settings.json (.vscode/settings.json) — 注意事项
+
+当前 settings.json 包含:
+```json
+{
+    "cmake.cmakePath": "cube-cmake",
+    "cmake.configureArgs": ["-DCMAKE_COMMAND=cube-cmake"],
+    "cmake.preferredGenerators": ["Ninja"]
+}
+```
+
+这些是 STM32Cube IDE 扩展的配置。如果 VSCode 弹出 CMake 配置提示, 选择 "不要配置" 或使用我们手动配置好的 build 目录。不要让 CMake Tools 扩展重新配置, 否则可能覆盖我们的 ARM 工具链配置。
+
+## 五、OpenOCD 配置
+
+OpenOCD 安装路径:
+```
+D:/Development Environment/DevEnv/openocd-v0.12.0-i686-w64-mingw32/
+├── bin/
+│   └── openocd.exe
+└── share/openocd/scripts/
+    ├── interface/stlink.cfg      (ST-Link 接口)
+    └── target/stm32f4x.cfg       (STM32F4 目标)
+```
+
+如果 openocd.exe 执行报错 "找不到 libusb-1.0.dll" 等, 需要将 bin 目录加入 PATH 或把 DLL 复制到 openocd.exe 同目录。
+
+## 六、调试流程
+
+1. 连接 ST-Link 到 F407 底板 (SWD: SWCLK + SWDIO + GND)
+2. VSCode 打开项目
+3. 按 F5 → 自动执行:
+   a. tasks.json 中的 "CMake: Build" 任务 (ninja编译)
+   b. 启动 openocd (通过 serverpath 指定)
+   c. 连接 target, 烧录 elf
+   d. 停在 main() 函数入口
+4. F10 单步, F11 进入函数, Shift+F11 跳出, F5 继续运行
+
+## 七、文件结构速查
+
+```
+Core/
+├── Inc/                          CubeMX 外设头文件 (自动生成)
+├── Src/
+│   ├── main.c                    主程序 (在 USER CODE BEGIN/END 区加入用户代码)
+│   ├── stm32f4xx_it.c            中断服务 (USART1 IDLE + EXTI 按键)
+│   ├── gpio.c                    按键 EXTI 配置 (KEY1=PC7, KEY2=PC6)
+│   └── usart.c                   USART1 DMA 配置 (PA9/PA10, 115200)
+├── user_code/
+│   ├── ble_host.c/.h             BLE主机: E104-BT52 AT指令+透传收发
+│   ├── status_parser.c/.h        H743 状态行解析
+│   ├── cmd_handler.c/.h          指令封装 (:STATUS/:LOAD/:BRIGHT/...)
+│   ├── sd_browser.c/.h           SD卡文件浏览 (FatFS)
+│   ├── file_transfer.c/.h        :SAVE 文件传输 (120B/块, 15ms间隔)
+│   ├── ui_menu.c/.h              按键菜单+OLED显示
+│   ├── oled.c/.h                 OLED 驱动 (I2C, SSD1306)
+│   └── font.c/.h                 字体库
+```
+
+## 八、E104-BT52 BLE 模块注意事项
+
+- AT 指令**不需要** \r 或 \n 结尾
+- AT 响应格式: `+OK\r\n` 或 `+ERR=NUM\r\n`
+- 连接事件: `\r\nSTA:connect,1,<MAC>\r\n`
+- 断开事件: `\r\nSTA:disconnect\r\n`
+- 主机自动连接流程: AT+ROLE=1 → AT+TRANMD=1 → AT+BONDMAC=<目标MAC> → AT+SCAN=1
+- UART: 115200 8N1, 连接 PA9(TX)/PA10(RX)
+- 空中配置 (BLE): 使用 FFF3 特征, 先 `AT+AUTH=123456` 认证
+- BLE 数据通道: FFF1=Notify(从→主), FFF2=Write(主→从)

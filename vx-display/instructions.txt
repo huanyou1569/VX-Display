@@ -1,0 +1,249 @@
+# 动画系统优化 & 静态色彩管理 —— 使用说明
+
+## 一、项目概述
+
+本项目的 STM32H743 POV 旋转 LED 显示屏 (32 strip × 24 LED) 支持三种显示模式：
+
+| 模式 | 格式 | 帧大小 | 换帧方式 | 适用场景 |
+|------|------|--------|----------|----------|
+| **静态** (SlicePlayer) | .slices format=0x02 | 225KB | 无 (固定一帧) | 静态 3D 模型 |
+| **动画 V1** (AnimPlayer) | .slices format=0x02 | 225KB/帧 | SD 卡 f_read (~180ms, 有冻结) | 低帧率动画 |
+| **动画 V2** (AnimV2) | .slices format=0x03 | 4.8KB/帧 | CPU 展开 (~300µs, 零冻结) | **推荐**, 高帧率动画 |
+
+---
+
+## 二、动画 V2 核心原理 (1-bit + 50片 + 180度对称)
+
+### 2.1 为什么只要 50 片
+
+100 相位对应电机一圈 360 度。利用 180 度旋转对称性：
+- phase 0-49: 正向存储
+- phase 50-99: 通过 `__RBIT` (位反转) 从 phase 0-49 重建
+
+Strip 0 在 0 度位置, Strip 31 在 180 度位置。电机转 180 度后, Strip 0 移到原来 Strip 31 的位置。`__RBIT(word)` 在一周期内反转全部 32 位, 自动完成这个映射。
+
+### 2.2 数据格式 (format=0x03)
+
+```
+16 字节头:
+  0: magic[4]    = "VXSL"
+  4: strips[2]   = 32
+  6: leds[2]     = 24
+  8: depth[2]    = 50      (>0 触发 AnimV2)
+ 10: frames[2]   = N       (总动画帧数)
+ 12: format[1]   = 0x03    (1-bit 体素 + 调色板)
+ 13: palette_r   (0-255)
+ 14: palette_g   (0-255)
+ 15: palette_b   (0-255)
+
+每帧数据: 50片 x 96字节 = 4800 字节
+每片 96 字节 = 24 LEDs x 32 strips 打包为 1-bit 位图
+  LED_i 的 strip_j -> data[led*4 + strip/8] 的 bit(strip%8)
+```
+
+### 2.3 缓冲布局
+
+```
+AXI SRAM (512KB):
+  g_display_buf: 225KB  (100片展开后 state, 含 __RBIT 反转预计算)
+
+RAM_D2 (288KB):
+  g_ramd2_buf: 全部 1-bit 帧 (N x 4.8KB, 最大 48 帧 = 230KB)
+```
+
+### 2.4 展开算法 (关键代码在 anim_player_v2.c)
+
+开机时 `AnimV2_Load()`:
+1. f_read 全部帧 (N x 4800 字节) 到 g_ramd2_buf (一次性, ~100ms)
+2. CPU 展开帧 0: 1-bit -> 576 mask words x 100 phases
+3. 正向 50 片 + __RBIT 反转 50 片 = 100 片完整 state
+
+换帧时 `AnimV2_AdvanceFrame()`:
+1. CPU 展开下一帧 -> 写入 g_display_buf (~300µs)
+2. 零 SD 卡访问, 零冻结
+
+播放时 `AnimV2_RenderNext()`:
+1. 霍尔触发 -> 复位 phase=0, 标记换帧
+2. WS2812_ShowFromSlice(g_display_buf[phase * 2304]) -> 169µs
+
+180度对称的核心代码 (anim_player_v2.c 第 72-88 行):
+```c
+uint32_t *fwd = state_buf + phase * 2304;           // 正向 0-49
+uint32_t *rev = state_buf + (phase + 50) * 2304;    // 反向 50-99
+
+uint32_t word_rev = __RBIT(word);  // 单周期位反转
+
+fwd[led * 24 + k] = word;          // 正向: 原序
+rev[led * 24 + k] = word_rev;      // 反向: 反转序
+```
+展开时一次性算好全部 100 片的 state, 渲染时无需判断 phase 范围,
+直接 g_display_buf[phase * 2304] 取用。
+
+### 2.5 与其他模式的对比
+
+|                  | V1 动画 (format=0x02) | V2 动画 (format=0x03) |
+|------------------|----------------------|----------------------|
+| 每帧存储          | 225KB                | 4.8KB                |
+| 22帧大小          | 5MB                  | 103KB                |
+| 换帧方式          | f_read (180ms 冻结)   | CPU 展开 (~300µs)     |
+| 1000HPS 可行性    | 不可                  | 可                   |
+| 播放 CPU/相位     | 169µs                | 169µs                |
+
+---
+
+## 三、静态炫彩 (colorize_slices.py)
+
+### 3.1 原理
+
+静态 .slices (format=0x02) 的 state 数据是 576 个 uint32_t mask word,
+颜色隐含在哪些 GRB bit 位置有非零 mask。colorize_slices.py 不改 header,
+只改写 mask 分布:
+
+1. 对每片的每个 LED (24层), 取 24 个 word 的 OR 得到 strip mask
+2. mask=0 -> 跳过 (保持灭)
+3. mask!=0 -> 清零 24 个 word, 按新颜色写回对应 GRB bit 位置
+
+**MCU 端零改动**, 输出文件和原始 .slices 格式完全兼容。
+
+### 3.2 用法
+
+```bash
+cd fbx_pipeline
+
+# DNA 科学渐变 (蓝->青->绿->黄->红, 默认)
+python colorize_slices.py chiken.slices -o chiken_dna.slices
+
+# 全色环彩虹
+python colorize_slices.py chiken.slices -o chiken_rainbow.slices --profile rainbow
+
+# 海洋渐变
+python colorize_slices.py chiken.slices -o chiken_ocean.slices --profile ocean
+
+# 火焰渐变
+python colorize_slices.py chiken.slices -o chiken_fire.slices --profile fire
+
+# 霓虹跳跃色
+python colorize_slices.py chiken.slices -o chiken_neon.slices --profile neon
+
+# 自定义颜色文件 (24行 R,G,B, 值域 0-255)
+python colorize_slices.py chiken.slices -o out.slices --colors my_colors.txt
+
+# 调整最大亮度 (默认 35, 自动等比压缩)
+python colorize_slices.py chiken.slices -o out.slices --max-brightness 50
+
+# 列出所有预设
+python colorize_slices.py --list-profiles
+```
+
+### 3.3 自定义颜色文件格式
+
+```
+# my_colors.txt - 24 行, LED 0 (底部) 到 LED 23 (顶部)
+0,0,35        # LED 0: 深蓝
+0,5,35        # LED 1
+...
+35,0,0        # LED 23: 红色
+```
+
+输入值域 0-255, 脚本自动等比压缩到 --max-brightness (默认 35)。
+
+---
+
+## 四、PC 端导出流水线
+
+### 4.1 静态模型
+
+```bash
+# 标准导出 (format=0x02, 100片)
+VxDisplay.Exporter.exe model.stl --slices -c R,G,B
+
+# V2 格式导出 (format=0x03, 50片, 1-bit)
+VxDisplay.Exporter.exe model.stl --slices --format v2 -c R,G,B
+```
+
+### 4.2 动画模型
+
+```bash
+# Step 1: Blender 导出 STL 序列
+#          (在 Blender 中运行 fbx_pipeline/export_frames.py)
+#          输出: fbx_pipeline/frames_stl/
+
+# Step 2: 批量切片
+cd fbx_pipeline
+python batch_convert.py frames_stl/*.stl --format v2 --shell -r X,90
+# 输出: fbx_pipeline/slices_out/frame_*.slices
+
+# Step 3: 合并为多帧动画
+python merge_slices.py slices_out/*.slices -o anim.slices
+# 输出: fbx_pipeline/anim.slices (format=0x03)
+
+# Step 4: 放入 TF 卡根目录
+#         MCU 开机自动加载 anim.slices
+```
+
+---
+
+## 五、MCU 端文件结构
+
+### 5.1 新增文件
+
+| 文件 | 用途 |
+|------|------|
+| `Core/user_code/anim_player_v2.h` | V2 动画播放器头文件 |
+| `Core/user_code/anim_player_v2.c` | V2 动画播放器实现 |
+
+### 5.2 修改文件
+
+| 文件 | 改动 |
+|------|------|
+| `Core/Src/main.c` | V2 渲染路径 + 启动加载 + 霍尔回调 + 修复悬空 else bug |
+| `Core/user_code/bt_commands.c` | CMD_LOAD format=0x03 路由 (V2 -> V1 -> 静态) |
+| `CMakeLists.txt` | 加入 anim_player_v2.c |
+
+### 5.3 渲染优先级
+
+```
+AnimV2 (format=0x03, 多帧)
+  -> AnimPlayer (format=0x02, 多帧)
+    -> SlicePlayer (format=0x02, 单帧/静态)
+      -> VolumeToWS2812 (体素实时渲染)
+```
+
+### 5.4 蓝牙指令
+
+```
+LOAD anim.slices    # 自动检测格式并选择播放器
+                    # format=0x03 -> AnimV2
+                    # format=0x02, depth>0 -> AnimPlayer (V1)
+                    # format=0x02, depth=0 -> SlicePlayer (静态)
+LOAD chiken.slices  # 加载静态切片
+```
+
+---
+
+## 六、PC 端文件结构
+
+| 文件 | 用途 |
+|------|------|
+| `RuiJi.Slice-master/VxDisplay.Exporter/VolumeExporter.cs` | 新增 ExportSlicesV2() (1-bit导出) |
+| `RuiJi.Slice-master/VxDisplay.Exporter/Program.cs` | 新增 --format v2, WriteSliceFileV2() |
+| `fbx_pipeline/batch_convert.py` | 新增 --format 参数 |
+| `fbx_pipeline/merge_slices.py` | 支持 format=0x03 合并 |
+| `fbx_pipeline/colorize_slices.py` | **新增** 静态炫彩着色 (5种预设) |
+| `fbx_pipeline/export_frames.py` | Blender FBX->STL 批量导出 |
+
+---
+
+## 七、关键常量速查
+
+```
+SLICE_SIZE            = 2304   (32 strip x 24 LED x 3 bytes)
+STATE_WORD_COUNT      = 576    (24 LED x 24 GRB bits)
+ANIM_V2_SLICES        = 50
+ANIM_V2_BIT_SIZE      = 96     (24 x 32 / 8)
+ANIM_V2_FRAME_SIZE    = 4800   (50 x 96)
+ANIM_V2_STATE_FULL    = 230400 (100 x 2304, 225KB)
+RAM_D2 max frames     = 48     (230416 / 4800)
+g_display_buf size    = 225KB  (AXI SRAM)
+g_ramd2_buf size      = 230416 (RAM_D2)
+```

@@ -1,0 +1,135 @@
+<html>
+<body>
+<pre>
+<h1>µVision Build Log</h1>
+<h2>Tool Versions:</h2>
+IDE-Version: ¦ÌVision V5.24.2.0
+Copyright (C) 2017 ARM Ltd and ARM Germany GmbH. All rights reserved.
+License Information: j asus, j, LIC=MPPLD-8LRKK-DY4V3-AN0XK-D2AWA-U8LD7
+ 
+Tool Versions:
+Toolchain:       MDK-ARM Plus  Version: 5.24.1
+Toolchain Path:  C:\Keil_v5\ARM\ARMCC\Bin
+C Compiler:      Armcc.exe V5.06 update 5 (build 528)
+Assembler:       Armasm.exe V5.06 update 5 (build 528)
+Linker/Locator:  ArmLink.exe V5.06 update 5 (build 528)
+Library Manager: ArmAr.exe V5.06 update 5 (build 528)
+Hex Converter:   FromElf.exe V5.06 update 5 (build 528)
+CPU DLL:         SARMCM3.DLL V5.24.1
+Dialog DLL:      DCM.DLL V1.16.0.0
+Target DLL:      STLink\ST-LINKIII-KEIL_SWO.dll V3.0.1.0
+Dialog DLL:      TCM.DLL V1.32.0.0
+ 
+<h2>Project:</h2>
+C:\Users\asus\Desktop\F103C8T6\DAC+OLED+PWM(SDIOºÍTIM)\MDK-ARM\DAC+OLED+PWM.uvprojx
+Project File Date:  05/17/2026
+
+<h2>Output:</h2>
+*** Using Compiler 'V5.06 update 5 (build 528)', folder: 'C:\Keil_v5\ARM\ARMCC\Bin'
+Build target 'DAC+OLED+PWM'
+compiling main.c...
+../Core/Inc/oled.h(13): warning:  #1295-D: Deprecated declaration OLED_Init - give arg types
+  void OLED_Init();
+../Core/Inc/oled.h(14): warning:  #1295-D: Deprecated declaration OLED_DisPlay_On - give arg types
+  void OLED_DisPlay_On();
+../Core/Inc/oled.h(15): warning:  #1295-D: Deprecated declaration OLED_DisPlay_Off - give arg types
+  void OLED_DisPlay_Off();
+../Core/Inc/oled.h(17): warning:  #1295-D: Deprecated declaration OLED_NewFrame - give arg types
+  void OLED_NewFrame();
+../Core/Inc/oled.h(18): warning:  #1295-D: Deprecated declaration OLED_ShowFrame - give arg types
+  void OLED_ShowFrame();
+../Core/Inc/oled.h(35): warning:  #1-D: last line of file ends without a newline
+  #endif // __OLED_H__
+../Core/Src/main.c(440): warning:  #550-D: variable "key2_now"  was set but never used
+  		uint8_t key2_now;
+../Core/Src/main.c(619): warning:  #111-D: statement is unreachable
+        last_joy_up = joy_up;
+../Core/Src/main.c(721): error:  #20: identifier "key2_now" is undefined
+      if (key2_now == 0 && last_key2_state == 1
+../Core/Src/main.c(739): error:  #20: identifier "key2_now" is undefined
+        last_key2_state = key2_now;
+../Core/Src/main.c(749): error:  #169: expected a declaration
+  }
+../Core/Src/main.c(778): warning:  #12-D: parsing restarts here after previous syntax error
+      Error_Handler();
+../Core/Src/main.c(779): error:  #169: expected a declaration
+    }
+../Core/Src/main.c(784): warning:  #12-D: parsing restarts here after previous syntax error
+                                |
+CC_CLOCKTYPE_PCLK1|
+CC_CLOCKTYPE_PCLK2;
+../Core/Src/main.c(785): error:  #77-D: this declaration has no storage class or type specifier
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+../Core/Src/main.c(785): error:  #65: expected a ";"
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+../Core/Src/main.c(786): error:  #77-D: this declaration has no storage class or type specifier
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+../Core/Src/main.c(786): error:  #65: expected a ";"
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+../Core/Src/main.c(787): error:  #77-D: this declaration has no storage class or type specifier
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+../Core/Src/main.c(787): error:  #65: expected a ";"
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+../Core/Src/main.c(788): error:  #77-D: this declaration has no storage class or type specifier
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+../Core/Src/main.c(788): error:  #65: expected a ";"
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+../Core/Src/main.c(790): error:  #169: expected a declaration
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+../Core/Src/main.c(820): warning:  #12-D: parsing restarts here after previous syntax error
+  									rpm_buffer[rpm_buf_index % 
+PM_FILTER_WINDOW] = (uint16_t)rpm;
+../Core/Src/main.c(821): error:  #77-D: this declaration has no storage class or type specifier
+  									rpm_buf_index++;
+../Core/Src/main.c(821): error:  #147: declaration is incompatible with "uint8_t rpm_buf_index"  (declared at line 126)
+  									rpm_buf_index++;
+../Core/Src/main.c(821): error:  #65: expected a ";"
+  									rpm_buf_index++;
+../Core/Src/main.c(824): error:  #169: expected a declaration
+  									for (uint8_t i = 0; i < RPM_FILTER_WINDOW; i++)
+../Core/Src/main.c(826): error:  #77-D: this declaration has no storage class or type specifier
+  									current_rpm = (uint16_t)(sum / RPM_FILTER_WINDOW);
+../Core/Src/main.c(826): error:  #147: declaration is incompatible with "volatile uint16_t current_rpm"  (declared at line 108)
+  									current_rpm = (uint16_t)(sum / RPM_FILTER_WINDOW);
+../Core/Src/main.c(826): error:  #148: variable "current_rpm"  has already been initialized
+  									current_rpm = (uint16_t)(sum / RPM_FILTER_WINDOW);
+../Core/Src/main.c(826): error:  #28: expression must have a constant value
+  									current_rpm = (uint16_t)(sum / 
+PM_FILTER_WINDOW);
+../Core/Src/main.c(827): error:  #169: expected a declaration
+  							}
+../Core/Src/main.c(830): warning:  #12-D: parsing restarts here after previous syntax error
+  			last_pulse_tick = now;
+../Core/Src/main.c(831): error:  #169: expected a declaration
+  	}
+../Core/Src/main.c(891): warning: At end of source:  #12-D: parsing restarts here after previous syntax error
+../Core/Src/main.c: 13 warnings, 23 errors
+compiling tim.c...
+"DAC+OLED+PWM\DAC+OLED+PWM.axf" - 23 Error(s), 13 Warning(s).
+
+<h2>Software Packages used:</h2>
+
+Package Vendor: ARM
+                http://www.keil.com/pack/ARM.CMSIS.5.0.1.pack
+                ARM.CMSIS.5.0.1
+                CMSIS (Cortex Microcontroller Software Interface Standard)
+   * Component: CORE Version: 5.0.1
+
+Package Vendor: Keil
+                https://www.keil.com/pack/Keil.STM32F4xx_DFP.2.17.0.pack
+                Keil.STM32F4xx_DFP.2.17.0
+                STMicroelectronics STM32F4 Series Device Support, Drivers and Examples
+
+<h2>Collection of Component include folders:</h2>
+  .\RTE\_DAC_OLED_PWM
+  C:\Keil_v5\ARM\PACK\ARM\CMSIS\5.0.1\CMSIS\Include
+  C:\Keil_v5\ARM\PACK\Keil\STM32F4xx_DFP\2.17.0\Drivers\CMSIS\Device\ST\STM32F4xx\Include
+
+<h2>Collection of Component Files used:</h2>
+
+   * Component: ARM::CMSIS:CORE:5.0.1
+Target not created.
+Build Time Elapsed:  00:00:06
+</pre>
+</body>
+</html>

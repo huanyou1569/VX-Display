@@ -1,0 +1,103 @@
+# ===== Build output =====
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+compile_commands.json
+*.dir/
+
+# ===== Binaries & artifacts =====
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# ===== IDE / Editor =====
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# ===== STM32CubeMX =====
+mx.scratch
+
+# ===== Eclipse =====
+.metadata/
+.settings/
+
+# ===== MDK-ARM =====
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.scvd
+MDK-ARM/*.crf
+MDK-ARM/*.d
+MDK-ARM/*.o
+MDK-ARM/*.htm
+MDK-ARM/*.lnp
+MDK-ARM/*.axf
+MDK-ARM/*.iex
+MDK-ARM/JLink*
+MDK-ARM/RTE/
+
+# ===== Python =====
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.spec
+
+# ===== C# .NET =====
+**/bin/
+**/obj/
+*.user
+*.suo
+*.cache
+*.pdb
+packages/
+
+# ===== Environment & secrets =====
+.env
+.env.*
+.env.local
+.env.*.local
+*.env
+!*.env.example
+credentials.json
+secrets.yaml
+secrets.yml
+*.pem
+*.key
+
+# ===== OS files =====
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
+
+# ===== Logs =====
+*.log
+
+# ===== Generated pipeline artifacts =====
+fbx_pipeline/frames_stl*/
+fbx_pipeline/slices_out/
+fbx_pipeline/*.slices
+fbx_pipeline/*.bin
+
+# ===== Keep project files =====
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
